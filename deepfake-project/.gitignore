@@ -1,0 +1,8 @@
+# Ignore datasets
+data/
+*.csv
+*.zip
+*.tar
+*.pth
+*.pt
+*.h5
