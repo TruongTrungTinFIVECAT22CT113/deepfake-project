@@ -1,0 +1,4 @@
+# 1. Lệnh train cho Detector. 
+py -m deepfake_detector.src.train --epochs 30 --freeze_epochs 0 --batch_size 128 --micro_batch 128 --ema --model vit_base_patch16_224 --img_size 480 --mixup 0.05 --cutmix 0.05 --mixup_prob 0.5 --label_smoothing 0.05 --lr 3e-4 --warmup_steps 8715 --balance_by_method --face_crop --method_boost "Face2Face=2.5,FaceShifter=2.5,NeuralTextures=2.5,FaceSwap=2.5"
+# 2. Để tiếp tục từ khoảng nghỉ.
+py -m deepfake_detector.src.train --epochs 30 --freeze_epochs 0 --batch_size 128 --micro_batch 128 --ema --model vit_base_patch16_224 --img_size 480 --mixup 0.05 --cutmix 0.05 --mixup_prob 0.5 --label_smoothing 0.05 --lr 3e-4 --warmup_steps 8715 --balance_by_method --face_crop --method_boost "Face2Face=2.5,FaceShifter=2.5,NeuralTextures=2.5,FaceSwap=2.5" --auto_resume

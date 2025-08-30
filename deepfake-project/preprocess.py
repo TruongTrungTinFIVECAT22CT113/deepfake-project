@@ -1,55 +1,94 @@
-import cv2
-import os
-import glob
-import random
+# preprocess.py
+import os, glob, random, argparse
 from pathlib import Path
 from tqdm import tqdm
+import cv2
 
-# Input data
-DATA_ROOT = "data/FaceForensics_C23"
-OUT_ROOT = "data/processed/faces"
-FRAME_INTERVAL = 10  # lấy 1 frame mỗi 10 frames
-VAL_SPLIT = 0.2
+# preprocess.py (đoạn đầu)
+METHODS = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
+ALIASES = {"DeepFakeDetection": "Deepfakes"}  # gộp DFD → Deepfakes
 
-def extract_frames(video_path, out_dir, label):
+def extract_frames(video_path, out_dir, frame_every=10):
     cap = cv2.VideoCapture(video_path)
     count, saved = 0, 0
+    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
-        if count % FRAME_INTERVAL == 0:
-            out_path = os.path.join(out_dir, f"{Path(video_path).stem}_{saved}.jpg")
-            cv2.imwrite(out_path, frame)
+        if not ret: break
+        if count % frame_every == 0:
+            out_path = out_dir / f"{Path(video_path).stem}_{saved}.jpg"
+            cv2.imwrite(str(out_path), frame)
             saved += 1
         count += 1
     cap.release()
     return saved
 
+def collect_videos(data_root):
+    data_root = Path(data_root)
+    real = sorted([str(p) for p in data_root.joinpath("original").rglob("*.mp4")])
+    fake_by_method = {m: [] for m in METHODS}
+    # nạp cả thư mục alias nếu còn tồn tại
+    for m in list(METHODS) + list(ALIASES.keys()):
+        dst = ALIASES.get(m, m)
+        vids = sorted([str(p) for p in data_root.joinpath(m).rglob("*.mp4")])
+        fake_by_method[dst].extend(vids)
+    return real, fake_by_method
+
+def split_list(lst, val_split):
+    n = int(len(lst) * (1.0 - val_split))
+    return lst[:n], lst[n:]
+
 def main():
-    real_videos = glob.glob(os.path.join(DATA_ROOT, "original", "**", "*.mp4"), recursive=True)
-    fake_videos = []
-    for sub in ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures", "DeepFakeDetection"]:
-        fake_videos += glob.glob(os.path.join(DATA_ROOT, sub, "**", "*.mp4"), recursive=True)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data_root", type=str, default="data/videos")
+    ap.add_argument("--out_root", type=str,  default="data/processed/faces")
+    ap.add_argument("--frame_every", type=int, default=10, help="lấy 1 frame mỗi N frames")
+    ap.add_argument("--val_split", type=float, default=0.2)
+    args = ap.parse_args()
 
-    print(f"Found {len(real_videos)} real and {len(fake_videos)} fake videos.")
+    out_root = Path(args.out_root)
+    # --- Xoá 2 thư mục train/val cũ nếu tồn tại ---
+    for split in ["train", "val"]:
+        d = out_root / split
+        if d.exists():
+            print(f"⚠️  Xoá thư mục cũ: {d}")
+            for p in d.rglob("*"):
+                if p.is_file(): p.unlink()
+            for p in sorted(d.glob("**/*"), reverse=True):
+                if p.is_dir():
+                    try: p.rmdir()
+                    except Exception: pass
 
-    data_map = {"real": real_videos, "fake": fake_videos}
+    real_videos, fake_by_method = collect_videos(args.data_root)
+    print(f"🎞️  Found {len(real_videos)} real videos")
+    for m in METHODS:
+        print(f"    - {m}: {len(fake_by_method[m])} videos")
 
-    for label, videos in data_map.items():
-        random.shuffle(videos)
-        split_idx = int(len(videos) * (1 - VAL_SPLIT))
-        train_videos, val_videos = videos[:split_idx], videos[split_idx:]
+    # --- REAL ---
+    random.shuffle(real_videos)
+    tr, va = split_list(real_videos, args.val_split)
+    totals = {"train_real":0, "val_real":0}
+    for v in tqdm(tr, desc="real-train"):
+        totals["train_real"] += extract_frames(v, out_root/"train"/"real", args.frame_every)
+    for v in tqdm(va, desc="real-val"):
+        totals["val_real"] += extract_frames(v, out_root/"val"/"real", args.frame_every)
 
-        for split, split_videos in [("train", train_videos), ("val", val_videos)]:
-            out_dir = os.path.join(OUT_ROOT, split, label)
-            os.makedirs(out_dir, exist_ok=True)
-            total_frames = 0
-            for vid in tqdm(split_videos, desc=f"{label}-{split}"):
-                total_frames += extract_frames(vid, out_dir, label)
-            print(f"[{label}-{split}] Extracted {total_frames} frames → {out_dir}")
+    # --- FAKE BY METHOD ---
+    totals_fake = {}
+    for m in METHODS:
+        vids = fake_by_method[m]
+        random.shuffle(vids)
+        tr, va = split_list(vids, args.val_split)
+        totals_fake[m] = {"train":0,"val":0}
+        for v in tqdm(tr, desc=f"{m}-train"):
+            totals_fake[m]["train"] += extract_frames(v, out_root/"train"/"fake"/m, args.frame_every)
+        for v in tqdm(va, desc=f"{m}-val"):
+            totals_fake[m]["val"]   += extract_frames(v, out_root/"val"/"fake"/m, args.frame_every)
 
     print("✅ Preprocessing done!")
+    print(f"[REAL] train: {totals['train_real']} | val: {totals['val_real']}")
+    for m in METHODS:
+        print(f"[FAKE/{m}] train: {totals_fake[m]['train']} | val: {totals_fake[m]['val']}")
 
 if __name__ == "__main__":
     main()

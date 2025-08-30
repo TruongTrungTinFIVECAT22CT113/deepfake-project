@@ -1,4 +1,4 @@
-# eval_val.py  — đo Acc + Confusion Matrix cho detector
+# eval_val.py  — đo Acc + Confusion Matrix cho detector (auto lấy img_size từ checkpoint)
 import argparse, glob, numpy as np
 from PIL import Image
 import torch
@@ -15,12 +15,14 @@ def load_model(ckpt_path):
     std  = meta.get("norm_std",  [0.5,0.5,0.5])
     thr  = float(meta.get("threshold", 0.5))
     model_name = meta.get("model_name", "vit_base_patch16_224")
+    img_size = int(meta.get("img_size", 224))  # 👈 đọc size đã train
 
     model = timm.create_model(model_name, pretrained=False, num_classes=2)
     model.load_state_dict(ckpt["model"], strict=False)
     model.to(DEVICE).eval()
+
     tfm = transforms.Compose([
-        transforms.Resize((224,224)),
+        transforms.Resize((img_size, img_size)),  # 👈 resize đúng size
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
@@ -39,7 +41,7 @@ def main():
     ap.add_argument("--data_root", default="data/processed/faces")
     ap.add_argument("--split", choices=["val","train"], default="val")
     ap.add_argument("--max_per_class", type=int, default=5000, help="giới hạn mỗi lớp (0=không giới hạn)")
-    ap.add_argument("--batch", type=int, default=128)
+    ap.add_argument("--batch", type=int, default=64)  # 384x384 nên để batch eval vừa phải
     args = ap.parse_args()
 
     model, tfm, classes, thr = load_model(args.ckpt)
@@ -56,13 +58,12 @@ def main():
     X = torch.stack(X); y = np.array(y)
 
     probs = []
-    model.eval()
     for i in range(0, len(X), args.batch):
         probs.append(predict_probs(model, X[i:i+args.batch].to(DEVICE)).cpu().numpy())
     probs = np.concatenate(probs)
 
     # Quyết định theo threshold (prob_fake >= thr -> dự đoán fake)
-    pred_fake_flag = (probs >= thr).astype(int)  # 1= fake, 0= real
+    pred_fake_flag = (probs >= thr).astype(int)  # 1=fake, 0=real
     # Đổi về nhãn 0=fake,1=real:
     y_pred = np.where(pred_fake_flag==1, 0, 1)
 
