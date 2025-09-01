@@ -1,139 +1,178 @@
 # eval_by_method.py
-# Đo độ chính xác theo từng kiểu giả (DeepFakeDetection, Face2Face, ...), dùng checkpoint detector.
-# Ví dụ:
-#   py eval_by_method.py
-#   py eval_by_method.py --ckpt deepfake_detector/checkpoints/detector_best.pt --data_root data/processed/faces
+# Tính acc theo từng method trên .../val/fake/<Method>/*
+# Streaming, AMP, TTA, face-crop (tuỳ chọn) – khớp pipeline train.
 
-import os, argparse, numpy as np
-from pathlib import Path
-from collections import defaultdict, Counter
+import argparse, os, glob, numpy as np, torch, timm
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+import torch.nn as nn
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
-import torch
-from torchvision import transforms, datasets
-import timm
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-METHODS = ["DeepFakeDetection", "Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
+_FACE_DET = None
+def _lazy_face_det():
+    global _FACE_DET
+    if _FACE_DET is None:
+        try:
+            import mediapipe as mp
+            _FACE_DET = mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.3)
+        except Exception:
+            _FACE_DET = False
+    return _FACE_DET
 
-def load_detector(ckpt_path):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+def crop_face_pil(img, expand=0.25):
+    det = _lazy_face_det()
+    if not det:
+        return img
+    import numpy as np
+    w, h = img.size
+    arr = np.array(img)
+    res = det.process(arr[..., ::-1])
+    if not res.detections:
+        return img
+    best = max(res.detections, key=lambda d: d.location_data.relative_bounding_box.width *
+                                             d.location_data.relative_bounding_box.height)
+    r = best.location_data.relative_bounding_box
+    x0 = int(max(0, (r.xmin - expand) * w))
+    y0 = int(max(0, (r.ymin - expand) * h))
+    x1 = int(min(w, (r.xmin + r.width  + expand) * w))
+    y1 = int(min(h, (r.ymin + r.height + expand) * h))
+    if x1 <= x0 or y1 <= y0:
+        return img
+    return img.crop((x0, y0, x1, y1))
+
+class MultiHeadViT(nn.Module):
+    def __init__(self, backbone_name="vit_base_patch16_224", img_size=224, num_methods=6):
+        super().__init__()
+        self.backbone = timm.create_model(backbone_name, pretrained=False, num_classes=0, img_size=img_size)
+        feat_dim = self.backbone.num_features
+        self.head_cls = nn.Linear(feat_dim, 2)
+        self.head_mth = nn.Linear(feat_dim, num_methods)
+        self.dropout = nn.Dropout(0.1)
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.dropout(feat)
+        return self.head_cls(feat), self.head_mth(feat)
+
+def load_model(ckpt_path):
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     meta = ckpt.get("meta", {})
+    classes = meta.get("classes", ["fake","real"])
+    method_names = meta.get("method_names", ["Deepfakes","Face2Face","FaceShifter","FaceSwap","NeuralTextures","Other"])
+    mean = meta.get("norm_mean", [0.5,0.5,0.5])
+    std  = meta.get("norm_std",  [0.5,0.5,0.5])
+    thr  = float(meta.get("threshold", 0.5))
     model_name = meta.get("model_name", "vit_base_patch16_224")
-    img_size   = int(meta.get("img_size", 224))
-    mean = meta.get("norm_mean", [0.5,0.5,0.5]); std = meta.get("norm_std", [0.5,0.5,0.5])
+    img_size = int(meta.get("img_size", 224))
 
-    model = timm.create_model(model_name, pretrained=False, num_classes=2)
-    model.load_state_dict(ckpt["model"], strict=False)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device).eval()
+    model = MultiHeadViT(model_name, img_size=img_size, num_methods=len(method_names))
+    miss, unexp = model.load_state_dict(ckpt["model"], strict=False)
+    if miss or unexp:
+        print(f"⚠️  state_dict mismatch | missing={len(miss)} unexpected={len(unexp)}")
+    model.to(DEVICE).eval()
 
     tfm = transforms.Compose([
         transforms.Resize((img_size, img_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean, std)
     ])
-    thr_meta = float(meta.get("threshold", 0.5))
-    return model, tfm, device, thr_meta
+    return model, tfm, classes, method_names, thr, img_size
+
+class ImageListDataset(Dataset):
+    def __init__(self, paths, transform, do_face_crop=False):
+        self.paths = paths
+        self.tfm = transform
+        self.do_face_crop = do_face_crop
+    def __len__(self): return len(self.paths)
+    def __getitem__(self, idx):
+        p = self.paths[idx]
+        try:
+            im = Image.open(p).convert("RGB")
+            if self.do_face_crop:
+                im = crop_face_pil(im)
+        except Exception:
+            im = Image.new("RGB", (512,512), (0,0,0))
+        return self.tfm(im), p
 
 @torch.no_grad()
-def predict_batch(model, x):
-    logits = model(x)
-    logits = (logits + model(torch.flip(x, dims=[3]))) / 2
-    probs = torch.softmax(logits, dim=1)
-    return probs[:,0]  # fake
-
-def infer_method_from_path(path: str) -> str:
-    p = path.replace("\\","/")
-    if "/val/real/" in p: return "real"
-    for m in METHODS:
-        if f"/val/fake/{m}/" in p or f"/fake/{m}/" in p:
-            return m
-    # preprocess cũ: thử đọc từ tên file
-    low = os.path.basename(path).lower()
-    for m in METHODS:
-        if m.lower() in low: return m
-    return "fake_other"
+def predict_batch(model, xb, amp=True, tta=2):
+    if amp and DEVICE.type == "cuda":
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            lb, lm = model(xb)
+            if tta >= 2:
+                lb2, lm2 = model(torch.flip(xb, dims=[3]))
+                lb = (lb + lb2) / 2
+                lm = (lm + lm2) / 2
+    else:
+        lb, lm = model(xb)
+        if tta >= 2:
+            lb2, lm2 = model(torch.flip(xb, dims=[3]))
+            lb = (lb + lb2) / 2
+            lm = (lm + lm2) / 2
+    prob_fake = torch.softmax(lb, dim=1)[:, 0]
+    pred_meth = torch.argmax(lm, dim=1)
+    return prob_fake, pred_meth
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_root", type=str, default="data/processed/faces")
-    ap.add_argument("--ckpt", type=str, default="deepfake_detector/checkpoints/detector_best.pt")
-    ap.add_argument("--batch_size", type=int, default=128)
+    ap.add_argument("--ckpt", default="deepfake_detector/checkpoints/detector_best.pt")
+    ap.add_argument("--data_root", default="data/processed/faces")
+    ap.add_argument("--split", default="val")
+    ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--workers", type=int, default=4)
-    ap.add_argument("--thr", type=float, default=-1.0, help="ngưỡng cố định; <0 = tự tìm tối ưu theo bacc")
+    ap.add_argument("--limit", type=int, default=0, help="giới hạn mỗi method (0=all)")
+    ap.add_argument("--tta", type=int, default=2)
+    ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--face_crop", action="store_true", help="bật face crop khi eval")
     args = ap.parse_args()
 
-    model, tfm, device, thr_meta = load_detector(args.ckpt)
-    ds = datasets.ImageFolder(os.path.join(args.data_root, "val"),
-                              transform=tfm)
-    dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size,
-                                     shuffle=False, num_workers=args.workers,
-                                     pin_memory=True, persistent_workers=(args.workers>0))
-    paths = [p for (p, _) in ds.samples]
-    labels = np.array([y for (_, y) in ds.samples])  # 0=fake,1=real
-    probs = []
+    model, tfm, classes, method_names, thr, img_size = load_model(args.ckpt)
 
-    for x,_ in dl:
-        x = x.to(device, non_blocking=True)
-        probs.append(predict_batch(model, x).detach().cpu().numpy())
-    probs = np.concatenate(probs, axis=0)  # p_fake
+    root = os.path.join(args.data_root, args.split, "fake")
+    methods = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
 
-    # tìm threshold tốt nhất (balanced acc) nếu không chỉ định
-    if args.thr < 0:
-        best_thr, best_bacc = 0.5, 0.0
-        for thr in np.linspace(0.40, 0.80, 81):
-            pred_fake = (probs >= thr).astype(int)
-            y_fake = (labels == 0).astype(int)
-            tp = ((pred_fake==1) & (y_fake==1)).sum()
-            tn = ((pred_fake==0) & (y_fake==0)).sum()
-            fp = ((pred_fake==1) & (y_fake==0)).sum()
-            fn = ((pred_fake==0) & (y_fake==1)).sum()
-            tpr = tp / max(tp+fn, 1); tnr = tn / max(tn+fp, 1)
-            bacc = 0.5*(tpr+tnr)
-            if bacc > best_bacc:
-                best_bacc, best_thr = bacc, thr
-        thr = best_thr
-    else:
-        thr = float(args.thr)
+    print(f"== EVAL by method on {root} ==")
+    total_ok = total_all = 0
+    meth_report = {}
 
-    pred_fake = (probs >= thr).astype(int)
-    y_fake    = (labels == 0).astype(int)
-
-    # Tổng quan
-    tp = int(((pred_fake==1) & (y_fake==1)).sum())
-    tn = int(((pred_fake==0) & (y_fake==0)).sum())
-    fp = int(((pred_fake==1) & (y_fake==0)).sum())
-    fn = int(((pred_fake==0) & (y_fake==1)).sum())
-
-    acc = (tp+tn)/max(len(labels),1)
-    tpr = tp/max(tp+fn,1); tnr = tn/max(tn+fp,1); bacc = 0.5*(tpr+tnr)
-
-    print(f"=== Overall ===")
-    print(f"Threshold: {thr:.3f} (ckpt meta: {thr_meta:.3f})")
-    print(f"Acc: {acc:.4f} | BAcc: {bacc:.4f} | TPR(fake): {tpr:.4f} | TNR(real): {tnr:.4f}")
-    print(f"CM: tp={tp} tn={tn} fp={fp} fn={fn}")
-    print()
-
-    # Theo method
-    methods = [infer_method_from_path(p) for p in paths]
-    method_idx = defaultdict(list)
-    for i, m in enumerate(methods):
-        method_idx[m].append(i)
-
-    real_idx = method_idx.get("real", [])
-    tnr_real = float((pred_fake[real_idx]==0).sum()) / max(len(real_idx),1) if real_idx else float('nan')
-
-    print("=== Per-method (TPR trên ảnh fake của method đó) ===")
-    for m in METHODS:
-        idx = [i for i in method_idx.get(m, []) if labels[i]==0]
-        if not idx: 
-            print(f"{m:18s}: n=0")
+    for m in methods:
+        mp = os.path.join(root, m)
+        paths = sorted(glob.glob(os.path.join(mp, "*.*")))
+        if args.limit and args.limit > 0:
+            paths = paths[:args.limit]
+        if not paths:
             continue
-        tpr_m = float((pred_fake[idx]==1).sum())/len(idx)
-        bacc_m = 0.5*(tpr_m + (tnr_real if not np.isnan(tnr_real) else 0.0))
-        print(f"{m:18s}: n={len(idx):5d} | TPR={tpr_m:6.3f} | BAcc*={bacc_m:6.3f}")
 
-    if real_idx:
-        print(f"\n(real): n={len(real_idx)} | TNR={tnr_real:.3f}")
+        ds = ImageListDataset(paths, tfm, do_face_crop=args.face_crop)
+        dl = DataLoader(
+            ds, batch_size=args.batch, shuffle=False,
+            num_workers=args.workers, pin_memory=True, drop_last=False
+        )
+
+        ok_bin = 0; n = 0; ok_m = 0
+        for xb, pb in tqdm(dl, desc=f"{m} ({len(paths)} imgs) @ {img_size}px"):
+            xb = xb.to(DEVICE, non_blocking=True)
+            prob_fake, pred_meth = predict_batch(model, xb, amp=(not args.no_amp), tta=args.tta)
+            is_fake_pred = (prob_fake >= thr)
+            ok_bin += int(is_fake_pred.sum().item())
+            n += len(pb)
+            if m in method_names:
+                gt_idx = method_names.index(m)
+                ok_m += int((pred_meth.cpu().numpy() == gt_idx).sum())
+
+        acc_bin = ok_bin / max(n,1)
+        acc_mth = ok_m / max(n,1)
+        total_ok += ok_bin; total_all += n
+        meth_report[m] = (acc_bin, acc_mth, n)
+
+    print("\n== Summary ==")
+    for m,(acc_bin, acc_mth, n) in meth_report.items():
+        print(f"{m:15s} | bin_acc={acc_bin:0.4f} | method_acc={acc_mth:0.4f} | N={n}")
+    print(f"Overall bin_acc={total_ok/max(total_all,1):0.4f} | N={total_all}")
 
 if __name__ == "__main__":
+    torch.set_grad_enabled(False)
     main()
