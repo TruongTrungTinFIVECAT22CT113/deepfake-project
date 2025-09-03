@@ -1,4 +1,8 @@
-# 4. Lệnh train cho Generator. (thay X bằng số thứ tự epoch cuối cùng trong checkpoint)
-py -m deepfake_generator.src.train --data_root data/processed/faces --epochs 2 --max_steps 2000 --batch_size 2 --grad_accum 4 --rank 16 --save_every_steps 500
+# file readme thư mục deepfake-project\deepfake_generator
 
-py -m deepfake_generator.src.train --resume deepfake_generator/outputs/generic_lora/checkpoints/lora_epochX.pt 
+## deepfake_generator
+Hiện chưa triển khai module tạo sinh deepfake. Nếu thêm sau:
+- `src/train.py`: huấn luyện/điều khiển generator
+- `models/…`: định nghĩa kiến trúc
+- `utils/…`: tiện ích I/O, augmentation
+(Repo hiện chỉ dùng detector.)
