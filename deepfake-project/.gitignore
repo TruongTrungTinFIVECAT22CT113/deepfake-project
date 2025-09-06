@@ -1,8 +1,10 @@
 # Ignore datasets
 data/
+reports/env_report.txt
 *.csv
 *.zip
 *.tar
 *.pth
 *.pt
 *.h5
+*.pyc

@@ -1,6 +1,6 @@
 Python      : 3.11.0
 PyTorch     : 2.5.1+cu121 | CUDA=True | device_count=1
-CUDA device : NVIDIA GeForce RTX 4070 Ti SUPER
+CUDA device : NVIDIA GeForce RTX 4050 Laptop GPU
 
 Packages:
 - torch           2.5.1+cu121
