@@ -1,7 +1,10 @@
 # Ignore datasets
+__pycache__/
 data/
 reports/env_report.txt
-__pycache__/
+shared/__pycache__/
+deepfake_detector/__pycache__/
+deepfake_generator/__pycache__/
 *.csv
 *.zip
 *.tar
