@@ -1,6 +1,7 @@
 # Ignore datasets
 data/
 reports/env_report.txt
+__pycache__/
 *.csv
 *.zip
 *.tar
