@@ -11,7 +11,12 @@ import torch, torch.nn as nn
 import timm
 from torchvision import transforms
 import gradio as gr
-
+import sys
+import argparse
+parser = argparse.ArgumentParser()
+parser.add_argument('--thr', type=float, default=None)
+args, _ = parser.parse_known_args()
+CLI_THR = args.thr
 # ====== Optional: dùng imageio (ffmpeg) để ghi MP4 H.264 cho HTML5 dễ phát ======
 try:
     import imageio.v2 as imageio
@@ -25,8 +30,8 @@ def ensure_dir(p):
     os.makedirs(p, exist_ok=True)
     return p
 
-CHECK_IMG_DIR = ensure_dir("data/check_img")
-CHECK_VID_DIR = ensure_dir("data/check_vid")
+#CHECK_IMG_DIR = ensure_dir("data/check_img")
+#CHECK_VID_DIR = ensure_dir("data/check_vid")
 
 # ========== Face detection (MediaPipe) ==========
 _FACE_DET = None
@@ -137,8 +142,8 @@ def load_detector(ckpt_path="deepfake_detector/checkpoints/detector_best_calib.p
     return model, tfm, classes, method_names, img_size, thr
 
 DETECTOR, DET_TFM, CLASSES, METHOD_NAMES, IMG_SIZE, DET_THR = load_detector()
-METHOD_DIRS     = {i: ensure_dir(os.path.join(CHECK_IMG_DIR, n)) for i,n in enumerate(METHOD_NAMES)}
-METHOD_DIRS_VID = {i: ensure_dir(os.path.join(CHECK_VID_DIR, n)) for i,n in enumerate(METHOD_NAMES)}
+#METHOD_DIRS     = {i: ensure_dir(os.path.join(CHECK_IMG_DIR, n)) for i,n in enumerate(METHOD_NAMES)}
+#METHOD_DIRS_VID = {i: ensure_dir(os.path.join(CHECK_VID_DIR, n)) for i,n in enumerate(METHOD_NAMES)}
 
 # ========== Inference helpers ==========
 @torch.no_grad()
@@ -195,35 +200,44 @@ def analyze_image(pil_img, use_face_crop=True, override_thr=None, tta=2, box_thi
     if use_face_crop:
         crops, boxes = crop_faces(img, max_faces=5)
     else:
-        W,H = img.size
-        crops, boxes = [img], [[0,0,W,H]]
+        W, H = img.size
+        crops, boxes = [img], [[0, 0, W, H]]
 
     thr = float(override_thr) if (override_thr is not None and not math.isnan(override_thr)) else float(DET_THR)
     img_rgb = np.array(img).copy()
-    best = {"p_fake":-1.0, "p_real":-1.0, "box":None, "m_idx":None, "pm":None}
+    best = {"p_fake": -1.0, "p_real": -1.0, "box": None, "m_idx": None, "pm": None}
 
     for crop, box in zip(crops, boxes):
         x = DET_TFM(crop)
         p_fake, p_real, pm = predict_image_tensor(x, tta=tta)
         if p_fake > best["p_fake"]:
-            best.update({"p_fake":p_fake, "p_real":p_real, "box":box, "m_idx":int(np.argmax(pm)), "pm":pm})
+            best.update({"p_fake": p_fake, "p_real": p_real, "box": box, "m_idx": int(np.argmax(pm)), "pm": pm})
 
     fr_bar_html = _render_fake_real_bar(best["p_fake"], best["p_real"])
     method_rows = _make_method_table(best["pm"]) if best["pm"] is not None else []
 
-    if best["p_fake"] >= thr and best["box"] is not None:
-        draw_box_np(img_rgb, best["box"], color=(255,0,0), thickness=int(box_thickness))
-        order = np.argsort(-best["pm"])
-        topk = [f"{METHOD_NAMES[i]}:{best['pm'][i]*100:.1f}%" for i in order[:3]]
+    # Quy tắc: FAKE nếu p_fake >= thr, ngược lại REAL
+    pred_fake = best["p_fake"] >= thr
+
+    if pred_fake and best["box"] is not None:
+        # Vẽ khung (KHÔNG lưu ảnh)
+        draw_box_np(img_rgb, best["box"], color=(255, 0, 0), thickness=int(box_thickness))
+        if best["pm"] is not None:
+            order = np.argsort(-best["pm"])
+            topk = [f"{METHOD_NAMES[i]}:{best['pm'][i]*100:.1f}%" for i in order[:3]]
+            top3_txt = " | Top-3: " + ", ".join(topk)
+            meth_txt = f" — Loại (best): {METHOD_NAMES[best['m_idx']]}"
+        else:
+            top3_txt, meth_txt = "", ""
+
         verdict = (
-            f"Có dấu hiệu deepfake — fake {best['p_fake']*100:.1f}% / real {best['p_real']*100:.1f}%"
-            f" | Loại (best): {METHOD_NAMES[best['m_idx']]}\nTop-3: " + ", ".join(topk)
+            f"Phát hiện deepfake (p_fake={best['p_fake']*100:.1f}% ≥ thr={thr*100:.1f}%)"
+            f"{meth_txt}{top3_txt}"
         )
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        out_dir = METHOD_DIRS.get(best["m_idx"], CHECK_IMG_DIR)
-        Image.fromarray(img_rgb).save(os.path.join(out_dir, f"det_{ts}.png"))
     else:
-        verdict = f"Không có dấu hiệu deepfake — real {best['p_real']*100:.1f}% / fake {best['p_fake']*100:.1f}%"
+        verdict = (
+            f"Không phát hiện deepfake (p_fake={best['p_fake']*100:.1f}% < thr={thr*100:.1f}%)"
+        )
 
     return Image.fromarray(img_rgb), verdict, fr_bar_html, method_rows
 
@@ -316,19 +330,13 @@ def analyze_video(video_path, use_face_crop=True, override_thr=None, tta=2, box_
     # Chọn method & nơi lưu (nếu có fake)
     if any_fake:
         m_idx = int(np.argmax(votes))
-        out_dir = METHOD_DIRS_VID.get(m_idx, CHECK_VID_DIR)
-        ensure_dir(out_dir)
-        final_path = os.path.join(out_dir, f"det_{ts}.mp4")
-        try: shutil.move(tmp_file, final_path)
-        except Exception: shutil.copy2(tmp_file, final_path)
-        try: shutil.rmtree(tmp_dir, ignore_errors=True)
-        except: pass
-        out_path = final_path
-        verdict = f"Video: Có dấu hiệu deepfake | Loại: {METHOD_NAMES[m_idx]} | lưu: {final_path}"
+        # KHÔNG lưu vào check_vid, chỉ trả về file tạm
+        out_path = tmp_file
+        verdict = f"Video: Có dấu hiệu deepfake | Loại: {METHOD_NAMES[m_idx]}"
     else:
         # không có fake frame nào => vẫn trả video tạm để xem
         out_path = tmp_file
-        verdict  = "Video: Không có dấu hiệu deepfake — đã render tạm để xem (không lưu vào check_vid)."
+        verdict  = "Video: Không có dấu hiệu deepfake — đã render tạm để xem."
 
     # Thanh % Fake/Real (lấy trung bình theo frame tốt nhất)
     if n_frames > 0:
@@ -364,12 +372,15 @@ def _vid_wrap(vid_path: str, fc: bool, thr: float, tta: int, thick: int):
     )
     return out_path, verdict, fr_bar_html, method_rows
 
+thr_default = float(CLI_THR) if CLI_THR is not None else float(DET_THR)
+thr_label = f"Ngưỡng kết luận (default {'từ dòng lệnh' if CLI_THR is not None else 'từ ckpt'}={thr_default:.3f})"
+
 with gr.Blocks(title="Deepfake Detect") as demo:
     gr.Markdown("## Deepfake Detect (UI)")
     with gr.Row():
         with gr.Column():
             face_crop = gr.Checkbox(label="Face crop", value=True)
-            thr = gr.Slider(0.0, 0.99, value=float(DET_THR), step=0.005, label=f"Ngưỡng kết luận (default từ ckpt={DET_THR:.3f})")
+            thr = gr.Slider(0.0, 0.99, value=thr_default, step=0.005, label=thr_label)
             tta = gr.Slider(1, 4, value=2, step=1, label="TTA (1 hoặc 2/3/4)")
             thick = gr.Slider(1, 8, value=3, step=1, label="Độ dày khung")
         with gr.Column():
