@@ -2,6 +2,9 @@
 # Tính acc theo từng method trên .../val/fake/<Method>/*
 # Streaming, AMP, TTA, face-crop (tuỳ chọn) – khớp pipeline train.
 
+import os
+import csv
+import datetime
 import argparse, os, glob, numpy as np, torch, timm
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -118,7 +121,7 @@ def predict_batch(model, xb, amp=True, tta=2):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default="deepfake_detector/checkpoints/detector_best.pt")
+    ap.add_argument("--ckpt", default="deepfake_detector/checkpoints/detector_best_calib.pt")
     ap.add_argument("--data_root", default="data/processed/faces")
     ap.add_argument("--split", default="val")
     ap.add_argument("--batch", type=int, default=64)
@@ -172,6 +175,20 @@ def main():
     for m,(acc_bin, acc_mth, n) in meth_report.items():
         print(f"{m:15s} | bin_acc={acc_bin:0.4f} | method_acc={acc_mth:0.4f} | N={n}")
     print(f"Overall bin_acc={total_ok/max(total_all,1):0.4f} | N={total_all}")
+
+    # ==== Xuất kết quả ra file CSV vào thư mục reports ====
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "..", "reports")
+    os.makedirs(out_dir, exist_ok=True)
+    out_csv = os.path.join(out_dir, f"eval_by_method_{ts}.csv")
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Method", "Binary_Accuracy", "Method_Accuracy", "N"])
+        for m, (acc_bin, acc_mth, n) in meth_report.items():
+            writer.writerow([m, f"{acc_bin:.4f}", f"{acc_mth:.4f}", n])
+        writer.writerow([])
+        writer.writerow(["Overall", f"{total_ok/max(total_all,1):.4f}", "", total_all])
+    print(f"\n[✓] Đã lưu kết quả vào {out_csv}")
 
 if __name__ == "__main__":
     torch.set_grad_enabled(False)
