@@ -103,20 +103,24 @@ def parse_thr_map(s, methods):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--split", choices=["val","test","train"], default="val")
-    ap.add_argument("--root", default=None, help="override dataset root")
     ap.add_argument("--tta", type=int, default=2)
     ap.add_argument("--face_crop", action="store_true")
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--per_method_thr", type=str, default="")
     ap.add_argument("--method_gate", type=float, default=0.55)
-    ap.add_argument("--out_csv", type=str, default=None)
+    ap.add_argument("--save_fp", type=str, default=None)
     ap.add_argument("--out_log", type=str, default=None)
     ap.add_argument("--log_every", type=int, default=2000)
     args = ap.parse_args()
 
-    if args.root is None:
-        args.root = os.path.join("data","processed","faces", args.split, "fake")  # toàn fake
+    # REAL set path:
+    root = os.path.join("data","processed","faces","val","real")
+    paths=[]
+    for ext in ("*.png","*.jpg","*.jpeg","*.bmp","*.webp"):
+        paths += glob(os.path.join(root, ext))
+    n=len(paths)
+    if n==0:
+        print("No images in REAL set."); return
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, tfm, classes, methods, img_size, thr_meta = load_detector(args.ckpt, device)
@@ -125,62 +129,52 @@ def main():
     thr_map = parse_thr_map(args.per_method_thr, methods)
     gate = float(args.method_gate)
 
-    method_dirs = [(m, os.path.join(args.root, m)) for m in methods if os.path.isdir(os.path.join(args.root, m))]
-    if not method_dirs:  # fallback
-        method_dirs = [(os.path.basename(p), p) for p in sorted(glob(os.path.join(args.root,"*"))) if os.path.isdir(p)]
+    if args.save_fp:
+        os.makedirs(args.save_fp, exist_ok=True)
 
-    lines=[]; rows=[]
-    overall_det=0; overall_n=0
-    for mname, mdir in method_dirs:
-        paths=[]
-        for ext in ("*.png","*.jpg","*.jpeg","*.bmp","*.webp"):
-            paths += glob(os.path.join(mdir, ext))
-        n=len(paths)
-        if n==0: continue
-        t0=time.time()
-        det=0; meth_ok=0
-        pbar=tqdm(total=n, desc=mname, ncols=100)
-        for i,p in enumerate(paths):
-            try:
-                img = Image.open(p).convert("RGB")
-            except:
-                pbar.update(1); continue
-            pf, pr, pm = predict_p(img, tfm, model, device, args.tta, idx_fake, idx_real)
-            m_idx=int(np.argmax(pm)); m_pred=methods[m_idx]; m_conf=float(pm[m_idx])
-            thr_eff = thr_map.get(m_pred, thr_global) if m_conf >= gate else thr_global
-            is_fake = (pf >= thr_eff)
-            if is_fake: det += 1
-            if m_pred == mname: meth_ok += 1
-            pbar.update(1)
-        pbar.close()
-        dt=time.time()-t0
-        ips = n/dt if dt>0 else 0.0
-        bin_acc = det/n
-        method_acc = meth_ok/n
-        lines.append(f"{mname:13s} | N={n:5d} | bin_acc={bin_acc:0.4f} | method_acc={method_acc:0.4f} | time={dt/60:0.2f} min | {ips:0.1f} img/s")
-        rows.append([mname, n, round(bin_acc,4), round(method_acc,4), round(ips,1)])
-        overall_det += det; overall_n += n
+    t0=time.time()
+    pred_real=0; pred_fake=0
+    wrong_by_method={}
+    pbar=tqdm(total=n, desc="REAL", ncols=100)
+    for i,p in enumerate(paths):
+        try:
+            img = Image.open(p).convert("RGB")
+        except:
+            pbar.update(1); continue
+        pf, pr, pm = predict_p(img, tfm, model, device, args.tta, idx_fake, idx_real)
+        m_idx = int(np.argmax(pm)); m_pred=methods[m_idx]; m_conf=float(pm[m_idx])
+        thr_eff = thr_map.get(m_pred, thr_global) if m_conf >= gate else thr_global
+        is_fake = (pf >= thr_eff)
+        if is_fake:
+            pred_fake += 1
+            wrong_by_method[m_pred] = wrong_by_method.get(m_pred, 0) + 1
+            if args.save_fp:
+                fname = os.path.basename(p)
+                img.save(os.path.join(args.save_fp, f"{m_pred}_{fname}"))
+        else:
+            pred_real += 1
+        pbar.update(1)
+    pbar.close()
+    dt=time.time()-t0
+    ips=n/dt if dt>0 else 0.0
 
-    for ln in lines: print(ln)
-    if overall_n>0:
-        print("\n== Summary ==")
-        for r in rows:
-            print(f"{r[0]:13s} | bin_acc={r[2]:0.4f} | method_acc={r[3]:0.4f} | N={r[1]}")
-        print(f"Overall bin_acc={overall_det/overall_n:0.4f} | N={overall_n} | total_time=—")
-
-    if args.out_csv is None:
-        args.out_csv = os.path.join("reports", f"eval_by_method_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
-    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
-        w=csv.writer(f); w.writerow(["method","N","bin_acc","method_acc","imgs_per_sec"])
-        for r in rows: w.writerow(r)
+    print("\n== Summary (REAL set) ==")
+    print(f"N={n} | pred_real={pred_real} ({pred_real/n*100:0.2f}%) | pred_fake={pred_fake} ({pred_fake/n*100:0.2f}%) | time={dt/60:0.2f} min | {ips:0.1f} img/s")
+    if wrong_by_method:
+        print("Dự đoán nhầm sang phương pháp (top-count):")
+        top = sorted(wrong_by_method.items(), key=lambda x:-x[1])[:5]
+        for k,v in top:
+            print(f"  - {k}: {v}")
 
     if args.out_log is None:
-        args.out_log = args.out_csv.replace(".csv",".log")
-    with open(args.out_log, "w", encoding="utf-8") as f:
-        for ln in lines: f.write(ln+"\n")
-        if overall_n>0:
-            f.write(f"Overall bin_acc={overall_det/overall_n:0.4f} | N={overall_n}\n")
+        args.out_log = os.path.join("reports", f"real_eval_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    os.makedirs(os.path.dirname(args.out_log), exist_ok=True)
+    with open(args.out_log,"w",encoding="utf-8") as f:
+        f.write(f"CKPT: {args.ckpt} | img={img_size} | Thr={thr_global:.3f} | TTA={args.tta} | face_crop={args.face_crop}\n\n")
+        f.write(f"N={n} | pred_real={pred_real} ({pred_real/n*100:.2f}%) | pred_fake={pred_fake} ({pred_fake/n*100:.2f}%) | time={dt/60:.2f} min | {ips:.1f} img/s\n")
+        if wrong_by_method:
+            f.write("Misclassified as methods (top):\n")
+            for k,v in top: f.write(f"  - {k}: {v}\n")
 
 if __name__ == "__main__":
     main()

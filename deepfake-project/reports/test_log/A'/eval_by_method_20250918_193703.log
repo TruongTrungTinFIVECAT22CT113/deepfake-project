@@ -1,0 +1,6 @@
+Deepfakes     | N=23931 | bin_acc=0.6221 | method_acc=0.7261 | time=12.94 min | 30.8 img/s
+Face2Face     | N=10301 | bin_acc=0.2265 | method_acc=0.1889 | time=4.45 min | 38.6 img/s
+FaceShifter   | N= 9732 | bin_acc=0.2448 | method_acc=0.1841 | time=4.36 min | 37.2 img/s
+FaceSwap      | N= 8301 | bin_acc=0.2706 | method_acc=0.3733 | time=3.68 min | 37.6 img/s
+NeuralTextures | N= 8368 | bin_acc=0.1526 | method_acc=0.0559 | time=3.60 min | 38.7 img/s
+Overall bin_acc=0.3814 | N=60633

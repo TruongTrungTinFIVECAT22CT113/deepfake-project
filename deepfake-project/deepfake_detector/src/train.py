@@ -1,554 +1,503 @@
-# deepfake_detector/src/train.py
-import argparse, os, time, math, signal, sys, random, io, re
-from datetime import timedelta
-from pathlib import Path
-from typing import Tuple, List
+# Cách chạy:
+#   python web.py --thr 0.75 --per_method_thr "Deepfakes=0.72,Face2Face=0.78,FaceShifter=0.76,FaceSwap=0.78,NeuralTextures=0.62" --method_gate 0.55 --enable_filters 1
+#
+# Trên UI có ô để đổi per-method threshold, method gate, bật/tắt filters mà không cần restart.
+#
+# Lưu ý:
+# - “method gate” (0..1): chỉ khi xác suất method-top ≥ gate thì mới áp dụng ngưỡng riêng &/hoặc filter.
+# - Hậu xử lý (filter) theo method là nhẹ/mặc định an toàn, ưu tiên giữ chi tiết gợn nén/biến dạng:
+#     Deepfakes      -> deblock nhẹ
+#     Face2Face      -> unsharp nhẹ
+#     FaceShifter    -> unsharp nhẹ
+#     FaceSwap       -> unsharp vừa
+#     NeuralTextures -> denoise rất nhẹ + unsharp rất nhẹ
+#
+# - Model đa đầu: head_bin (fake/real), head_m (method). Dùng score cao hơn giữa “gốc” và “đã filter”.
+# - Nếu checkpoint có “meta.threshold” -> dùng làm default thr; còn không thì lấy --thr hoặc slider.
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from torchvision import datasets, transforms
-from PIL import Image
+import os, io, time, math, tempfile, shutil, argparse
 import numpy as np
-import timm
-from timm.data.mixup import Mixup
-from timm.loss import SoftTargetCrossEntropy
-from timm.utils import ModelEmaV2
-
-# ----------------- Mapping method (khớp preprocess) -----------------
-ALL_METHODS_RAW = ["DeepFakeDetection", "Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures"]
-ALIASES = {"DeepFakeDetection": "Deepfakes"}
-METHODS = ["Deepfakes", "Face2Face", "FaceShifter", "FaceSwap", "NeuralTextures", "Other"]
-
-def set_seed(seed=42):
-    random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
-
-# ----------------- Face detector cho FaceCrop -----------------
-try:
-    import mediapipe as mp
-    _MP_OK = True
-    _mp_fd = mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
-except Exception:
-    _MP_OK = False
-    _mp_fd = None
+from PIL import Image
 import cv2
-_HAAR = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+import torch, torch.nn as nn
+import timm
+from torchvision import transforms
+import gradio as gr
 
-class FaceCenterCrop:
-    """Cắt quanh mặt lớn nhất rồi resize; nếu fail thì trả ảnh gốc."""
-    def __init__(self, enlarge=1.4): self.enlarge = float(enlarge)
-    def __call__(self, img: Image.Image):
-        bgr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        h, w = bgr.shape[:2]
-        boxes=[]
-        if _MP_OK and _mp_fd is not None:
-            res = _mp_fd.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-            if res and res.detections:
-                for d in res.detections:
-                    bb = d.location_data.relative_bounding_box
-                    x1 = max(0, int(bb.xmin*w)); y1 = max(0, int(bb.ymin*h))
-                    x2 = min(w-1, int((bb.xmin+bb.width)*w)); y2 = min(h-1, int((bb.ymin+bb.height)*h))
-                    if x2>x1 and y2>y1: boxes.append((x1,y1,x2,y2))
-        if not boxes:
-            g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            for (x,y,fw,fh) in _HAAR.detectMultiScale(g, 1.2, 5, minSize=(60,60)):
-                boxes.append((x,y,x+fw,y+fh))
-        if not boxes: return img
-        x1,y1,x2,y2 = max(boxes, key=lambda b:(b[2]-b[0])*(b[3]-b[1]))
-        cx=(x1+x2)/2; cy=(y1+y2)/2; s=max(x2-x1, y2-y1)*self.enlarge
-        nx1=int(max(0, cx-s/2)); ny1=int(max(0, cy-s/2))
-        nx2=int(min(w, cx+s/2));  ny2=int(min(h, cy+s/2))
-        crop=bgr[ny1:ny2, nx1:nx2]
-        if crop.size==0: return img
-        return Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+# ====================== CLI ======================
+parser = argparse.ArgumentParser()
+parser.add_argument('--thr', type=float, default=None)
+parser.add_argument('--per_method_thr', type=str, default="")  # "Deepfakes=0.72,Face2Face=0.78,..."
+parser.add_argument('--method_gate', type=float, default=0.55)
+parser.add_argument('--enable_filters', type=int, default=1)
+args, _ = parser.parse_known_args()
+CLI_THR = args.thr
+CLI_PM_THR_STR = args.per_method_thr or ""
+CLI_METHOD_GATE = float(args.method_gate)
+CLI_ENABLE_FILTERS = bool(args.enable_filters)
 
-# ----------------- Tiện ích -----------------
-class RandomJPEG:
-    def __init__(self, qmin=35, qmax=90, p=0.6): self.qmin, self.qmax, self.p = qmin, qmax, p
-    def __call__(self, img: Image.Image):
-        if random.random() > self.p: return img
-        q = random.randint(self.qmin, self.qmax); buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=q); buf.seek(0)
-        return Image.open(buf).convert("RGB")
+# ====== Optional: dùng imageio (ffmpeg) để ghi MP4 H.264 cho HTML5 dễ phát ======
+try:
+    import imageio.v2 as imageio
+    HAS_IMAGEIO = True
+except Exception:
+    HAS_IMAGEIO = False
 
-def infer_method_from_path(path: str) -> str:
-    p = path.replace("\\","/").lower()
-    if "/real/" in p: return "real"
-    for m in ALL_METHODS_RAW:
-        name = ALIASES.get(m, m).lower()
-        if f"/{name}/" in p or f"/{m.lower()}/" in p: return ALIASES.get(m, m)
-    for m in METHODS:
-        if m.lower() in p: return m
-    return "Other"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class ProgressMeter:
-    def __init__(self, total): self.total=int(total); self.start=time.time(); self.done=0
-    def step(self, n=1): self.done+=n
-    def text(self):
-        elapsed=time.time()-self.start; rate=self.done/max(elapsed,1e-9)
-        remaining=(self.total-self.done)/max(rate,1e-9) if self.total>self.done else 0
-        pct=100.0*self.done/max(self.total,1)
-        return (f"{pct:6.2f}% | {self.done}/{self.total} files | "
-                f"elapsed {timedelta(seconds=int(elapsed))} | "
-                f"remaining {timedelta(seconds=int(remaining))}")
+def ensure_dir(p):
+    os.makedirs(p, exist_ok=True)
+    return p
 
-def cosine_warmup(step, total_steps, warmup_steps):
-    if step < warmup_steps: return step / max(1, warmup_steps)
-    progress=(step-warmup_steps)/max(1, total_steps-warmup_steps)
-    return 0.5*(1.0+math.cos(math.pi*progress))
-
-# ----------------- Dataset (trả thêm method_idx) -----------------
-class ImageFolderWithMethod(datasets.ImageFolder):
-    def __init__(self, root, transform=None):
-        super().__init__(root, transform=transform)
-        self.method_to_idx = {m:i for i,m in enumerate(METHODS)}  # order fixed
-        self.sample_methods = []
-        for path, targ in self.samples:
-            if targ == 1:  # real
-                self.sample_methods.append(-1)
-            else:
-                m = infer_method_from_path(path)
-                if m == "real": m = "Other"
-                self.sample_methods.append(self.method_to_idx.get(m, self.method_to_idx["Other"]))
-    def __getitem__(self, index):
-        img, label = super().__getitem__(index)  # label: 0=fake, 1=real
-        m = self.sample_methods[index]
-        return img, label, m
-
-# ----------------- Mô hình Multi-head -----------------
-class MultiHeadViT(nn.Module):
-    def __init__(self, backbone_name="vit_base_patch16_224", img_size=224, pretrained=True, num_methods=len(METHODS)):
-        super().__init__()
-        self.backbone = timm.create_model(backbone_name, pretrained=pretrained, num_classes=0, img_size=img_size)
-        feat_dim = self.backbone.num_features
-        self.head_cls = nn.Linear(feat_dim, 2)            # fake/real
-        self.head_mth = nn.Linear(feat_dim, num_methods)  # method
-        self.dropout = nn.Dropout(0.1)
-    def set_grad_checkpointing(self, enable=True):
-        if hasattr(self.backbone, "set_grad_checkpointing"):
-            self.backbone.set_grad_checkpointing(enable)
-    def forward(self, x):
-        feat = self.backbone(x)
-        feat = self.dropout(feat)
-        return self.head_cls(feat), self.head_mth(feat)
-
-# ----------------- Trainer -----------------
-class Trainer:
-    def __init__(self, args):
-        self.args = args
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.ckpt_dir = Path(args.out_dir) / "checkpoints"; self.ckpt_dir.mkdir(parents=True, exist_ok=True)
-        self.best = {"acc": 0.0, "threshold": 0.5}
-        self.interrupted = False; self.frozen = False; self.start_epoch = 0
-
-        def _sigint(sig, frame):
-            print("\n[CTRL+C] Sắp lưu checkpoint an toàn…")
-            self.interrupted = True
-        signal.signal(signal.SIGINT, _sigint)
-
-    # ---------- Data ----------
-    def build_data(self):
-        img_size = self.args.img_size
-        self.mean, self.std = [0.5]*3, [0.5]*3
-
-        train_ops=[]
-        if self.args.face_crop: train_ops.append(FaceCenterCrop(enlarge=1.4))
-        train_ops += [
-            transforms.RandomResizedCrop(img_size, scale=(0.80,1.00)),
-            transforms.RandomHorizontalFlip(),
-            RandomJPEG(35,90,p=0.6),
-            transforms.ColorJitter(0.25,0.25,0.25,0.12),
-            transforms.RandomApply([transforms.GaussianBlur(3)], p=0.35),
-            transforms.RandomAffine(degrees=6, translate=(0.03,0.03)),
-            transforms.ToTensor(),
-            transforms.Normalize(self.mean, self.std),
-            transforms.RandomErasing(p=0.25, scale=(0.02,0.10), ratio=(0.3,3.3), value=0),
-        ]
-        val_ops=[]
-        if self.args.face_crop: val_ops.append(FaceCenterCrop(enlarge=1.3))
-        val_ops += [
-            transforms.Resize((img_size,img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(self.mean, self.std),
-        ]
-        train_tf, val_tf = transforms.Compose(train_ops), transforms.Compose(val_ops)
-
-        root = self.args.data_root
-        self.train_ds = ImageFolderWithMethod(os.path.join(root, "train"), transform=train_tf)
-        self.val_ds   = ImageFolderWithMethod(os.path.join(root, "val"),   transform=val_tf)
-
-        self.class_names = self.train_ds.classes  # ['fake','real']
-        self.method_names = METHODS
-        self.num_train_files = len(self.train_ds); self.num_val_files = len(self.val_ds)
-        print(f"🔎 Tổng số file train: {self.num_train_files} | val: {self.num_val_files}")
-        print(f"📂 Classes = {self.class_names}")
-
-        # ---- Sampler: cân bằng lớp + (tuỳ chọn) theo method + method_boost ----
-        targets = [s[1] for s in self.train_ds.samples]  # 0=fake, 1=real
-        counts = torch.bincount(torch.tensor(targets), minlength=2).float()
-        class_weights = 1.0 / torch.clamp(counts, min=1)
-
-        method_weights = None
-        boost = {}
-        if self.args.method_boost:
-            for kv in self.args.method_boost.split(","):
-                if "=" in kv:
-                    k,v = kv.split("="); boost[k.strip()] = float(v)
-
-        if self.args.balance_by_method:
-            from collections import Counter
-            methods = [infer_method_from_path(p) if t==0 else "real" for (p,t) in self.train_ds.samples]
-            cnt = Counter(methods)
-            method_weights = {m: 1.0 / max(c,1) for m,c in cnt.items()}
-            for k,v in boost.items():
-                if k in method_weights: method_weights[k] *= float(v)
-            print("⚖️  Balance by method:", cnt, "| boost:", boost or "{}")
-
-        sw=[]
-        for (path, tgt), m_idx in zip(self.train_ds.samples, self.train_ds.sample_methods):
-            w = float(class_weights[tgt])
-            if method_weights is not None:
-                m_name = "real" if tgt==1 else self.method_names[m_idx]
-                w *= method_weights.get(m_name, 1.0)
-            sw.append(w)
-        sample_weights = torch.tensor(sw, dtype=torch.float)
-        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
-
-        common = dict(num_workers=self.args.workers, pin_memory=True,
-                      persistent_workers=(self.args.workers>0), prefetch_factor=4)
-        self.train_loader = DataLoader(self.train_ds, batch_size=self.args.batch_size,
-                                       sampler=sampler, drop_last=True, **common)
-        val_bs = min(self.args.batch_size, max(1,self.args.micro_batch))
-        self.val_loader   = DataLoader(self.val_ds, batch_size=val_bs, shuffle=False, **common)
-
-        # Mixup/Cutmix
-        self.mixup_fn = None
-        if self.args.mixup > 0 or self.args.cutmix > 0:
-            self.mixup_fn = Mixup(mixup_alpha=self.args.mixup, cutmix_alpha=self.args.cutmix,
-                                  label_smoothing=self.args.label_smoothing, num_classes=2,
-                                  prob=self.args.mixup_prob)
-
-    # ---------- Model ----------
-    def build_model(self):
-        model_name = self.args.model
-        variant_map = {
-            ("vit_base_patch16_224", 384): "vit_base_patch16_384",
-            ("vit_large_patch16_224", 384): "vit_large_patch16_384",
-        }
-        eff_name = variant_map.get((model_name, self.args.img_size), model_name)
-
-        print(f"🧠 Model: {model_name} (effective: {eff_name}) | img_size={self.args.img_size}")
-        model = MultiHeadViT(eff_name, img_size=self.args.img_size, pretrained=True, num_methods=len(self.method_names))
-
-        # Freeze backbone N epoch đầu
-        for n,p in model.backbone.named_parameters(): p.requires_grad_(False)
-        self.frozen = True
-        print("🧊 Freeze backbone trong", self.args.freeze_epochs, "epoch đầu")
-
-        model.set_grad_checkpointing(self.args.grad_ckpt)
-
-        model.to(self.device)
-        self.ema = ModelEmaV2(model, decay=0.9998) if self.args.ema else None
-
-        # LOSS
-        self.criterion_bin_soft = SoftTargetCrossEntropy()
-        self.criterion_bin_hard = nn.CrossEntropyLoss(label_smoothing=self.args.label_smoothing)
-        self.criterion_mth = nn.CrossEntropyLoss()
-
-        self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=self.args.lr, weight_decay=2e-4, betas=(0.9, 0.999)
-        )
-        self.steps_per_epoch = len(self.train_loader)
-        self.total_steps = self.steps_per_epoch * self.args.epochs
-        self.scaler = torch.amp.GradScaler('cuda', enabled=(self.device.type=='cuda'))
-        self.model = model
-        self.model_name_effective = eff_name
-
-    # ---------- Resume ----------
-    def maybe_resume(self):
-        # auto-pick latest if requested and --resume is empty
-        if not self.args.resume and getattr(self.args, "auto_resume", False):
-            ckpts = list(self.ckpt_dir.glob("detector_epoch*.pt"))
-            if ckpts:
-                ckpts.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                self.args.resume = str(ckpts[0])
-                print(f"🔁 Auto-resume từ {self.args.resume}")
-
-        if not self.args.resume:
-            return
-
-        ckpt = torch.load(self.args.resume, map_location="cpu")
-        self.model.load_state_dict(ckpt["model"], strict=False)
-
-        # ---- OPTIMIZER / SCALER ----
-        if not self.args.reset_opt:
-            try:
-                if ckpt.get("optimizer"):
-                    self.optimizer.load_state_dict(ckpt["optimizer"])
-                if ckpt.get("scaler"):
-                    self.scaler.load_state_dict(ckpt["scaler"])
-            except Exception as e:
-                print(f"⚠️  Không thể load optimizer từ checkpoint ({e}). Sẽ bỏ qua và dùng optimizer mới.")
-        else:
-            print("🔄 Bỏ qua optimizer theo yêu cầu (--reset_opt).")
-
-        if self.ema and ckpt.get("ema") is not None:
-            self.ema.module.load_state_dict(ckpt["ema"])
-
-        # ---- epoch ----
-        meta = ckpt.get("meta", {})
-        self.best["threshold"] = float(meta.get("threshold", self.best["threshold"]))
-
-        start_ep = int(meta.get("epoch", 0))
-        if start_ep == 0:
-            import re, os
-            m = re.search(r'epoch(\d+)', os.path.basename(self.args.resume))
-            if m: start_ep = int(m.group(1))
-        self.start_epoch = start_ep
-
-        print(f"🔁 Resume từ {self.args.resume} (start_epoch={self.start_epoch})")
-
-        # 🔥 UNFREEZE NGAY KHI RESUME nếu đã qua giai đoạn freeze
-        if self.frozen and self.start_epoch >= self.args.freeze_epochs:
-            print(f"🔥 Unfreeze ngay khi resume (start_epoch={self.start_epoch} ≥ freeze_epochs={self.args.freeze_epochs})")
-            self._unfreeze_all()  # sẽ reset optimizer để thêm params backbone
-
-    def _unfreeze_all(self):
-        if self.frozen:
-            for p in self.model.backbone.parameters(): 
-                p.requires_grad_(True)
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(), lr=self.args.lr, weight_decay=2e-4, betas=(0.9,0.999)
+# ====================== Face detection (MediaPipe) ======================
+_FACE_DET = None
+def _lazy_face_det():
+    global _FACE_DET
+    if _FACE_DET is None:
+        try:
+            import mediapipe as mp
+            _FACE_DET = mp.solutions.face_detection.FaceDetection(
+                model_selection=0, min_detection_confidence=0.3
             )
-            self.frozen = False
-            print("🔥 Unfreeze toàn bộ backbone & reset optimizer")
+        except Exception:
+            _FACE_DET = False
+    return _FACE_DET
 
-    def save_ckpt(self, tag, extra_meta=None, epoch=None):
-        meta = {
-            "classes": self.class_names,
-            "method_names": self.method_names,
-            "model_name": self.model_name_effective,
-            "norm_mean": self.mean, "norm_std": self.std,
-            "threshold": self.best.get("threshold", 0.5),
-            "img_size": self.args.img_size,
-        }
-        if epoch is not None: meta["epoch"] = epoch
-        if extra_meta: meta.update(extra_meta)
+def detect_faces_xyxy(img_rgb):
+    """
+    img_rgb: np.uint8 RGB, shape (H,W,3)
+    return: list [[x0,y0,x1,y1], ...] (pixel)
+    """
+    det = _lazy_face_det()
+    H, W = img_rgb.shape[:2]
+    boxes = []
+    if not det:
+        return boxes
+    # MediaPipe FaceDetection nhận RGB
+    res = det.process(img_rgb)
+    if not res or not res.detections:
+        return boxes
+    for d in res.detections:
+        r = d.location_data.relative_bounding_box
+        x0 = int(max(0, r.xmin * W)); y0 = int(max(0, r.ymin * H))
+        x1 = int(min(W, (r.xmin + r.width) * W)); y1 = int(min(H, (r.ymin + r.height) * H))
+        if x1 > x0 and y1 > y0:
+            boxes.append([x0,y0,x1,y1])
+    return boxes
 
-        path = self.ckpt_dir / f"detector_{tag}.pt"
-        torch.save({
-            "model": self.model.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "scaler": self.scaler.state_dict(),
-            "ema": self.ema.module.state_dict() if self.ema else None,
-            "meta": meta
-        }, path)
-        print(f"💾 Saved checkpoint: {path}")
+def crop_faces(pil_img, max_faces=5, expand=0.25):
+    """
+    Trả về (crops(list PIL), boxes(list [x0,y0,x1,y1])).
+    Nếu không có mặt: trả 1 crop = full image.
+    """
+    img_rgb = np.array(pil_img.convert("RGB"))
+    H, W = img_rgb.shape[:2]
+    boxes = detect_faces_xyxy(img_rgb)
+    if not boxes:
+        return [pil_img], [[0,0,W,H]]
+    # expand box
+    out_crops, out_boxes = [], []
+    for (x0,y0,x1,y1) in boxes[:max_faces]:
+        cx = (x0+x1)/2; cy = (y0+y1)/2
+        w  = (x1-x0);   h  = (y1-y0)
+        s  = int(round(max(w,h)*(1.0+expand)))
+        nx0 = int(max(0, cx - s/2)); ny0 = int(max(0, cy - s/2))
+        nx1 = int(min(W, cx + s/2)); ny1 = int(min(H, cy + s/2))
+        crop = Image.fromarray(img_rgb[ny0:ny1, nx0:nx1])
+        out_crops.append(crop); out_boxes.append([nx0,ny0,nx1,ny1])
+    return out_crops, out_boxes
 
-    @torch.no_grad()
-    def evaluate(self, use_ema=True, tta=True) -> Tuple[float,float,float,float,float]:
-        model = self.ema.module if (self.ema and use_ema) else self.model
-        model.eval()
-        loss_sum, correct, count = 0.0, 0, 0
-        pm = ProgressMeter(total=self.num_val_files)
-        probs_fake, labels_bin, mth_true, mth_pred = [], [], [], []
+# ====================== Model ======================
+class MultiHeadViT(nn.Module):
+    def __init__(self, model_name="vit_base_patch16_224", num_methods=6, img_size=512, drop=0.0):
+        super().__init__()
+        self.backbone = timm.create_model(model_name, pretrained=False, num_classes=0, drop=drop, img_size=img_size)
+        feat_dim = self.backbone.num_features
+        self.dropout = nn.Dropout(p=0.0)
+        self.head_bin = nn.Linear(feat_dim, 2)           # fake/real
+        self.head_m  = nn.Linear(feat_dim, num_methods)  # method
 
-        for x, y, m in self.val_loader:
-            x, y, m = x.to(self.device), y.to(self.device), m.to(self.device)
-            with torch.amp.autocast('cuda', enabled=(self.device.type=='cuda')):
-                logits_bin, logits_m = model(x)
-                if tta:
-                    logits_bin2, logits_m2 = model(torch.flip(x, dims=[3]))
-                    logits_bin = (logits_bin + logits_bin2) / 2
-                    logits_m   = (logits_m + logits_m2) / 2
-                loss = nn.CrossEntropyLoss()(logits_bin, y)
+    def forward(self, x):
+        f = self.backbone(x)
+        f = self.dropout(f)
+        return self.head_bin(f), self.head_m(f)
 
-            prob_fake = torch.softmax(logits_bin, dim=1)[:,0]
-            probs_fake.append(prob_fake.detach().cpu()); labels_bin.append(y.detach().cpu())
-            loss_sum += loss.item() * x.size(0)
-            pred = logits_bin.argmax(1)
-            correct += (pred == y).sum().item(); count += x.size(0)
+def _remap_heads(state):
+    out = {}
+    for k,v in state.items():
+        if k.startswith("head_cls."):       # tương thích checkpoint cũ
+            out[k.replace("head_cls.","head_bin.")] = v
+        elif k.startswith("head_mth."):
+            out[k.replace("head_mth.","head_m.")] = v
+        else:
+            out[k] = v
+    return out
 
-            mask = (y == 0) & (m >= 0)
-            if mask.any():
-                mth_true.append(m[mask].detach().cpu())
-                mth_pred.append(logits_m[mask].argmax(1).detach().cpu())
+def load_detector(ckpt_path="deepfake_detector/checkpoints/detector_best.pt"):
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    meta = ckpt.get("meta", {})
+    classes = meta.get("classes", ["fake","real"])
+    method_names = meta.get("method_names", ["Deepfakes","Face2Face","FaceShifter","FaceSwap","NeuralTextures","Other"])
+    mean = meta.get("norm_mean", [0.5,0.5,0.5]); std = meta.get("norm_std", [0.5,0.5,0.5])
+    thr  = float(meta.get("threshold", 0.5))
+    model_name = meta.get("model_name", "vit_base_patch16_224")
+    img_size   = int(meta.get("img_size", 224))
 
-            pm.step(x.size(0)); print(f"\r[VAL] {pm.text()}", end="")
-        print()
+    model = MultiHeadViT(model_name, img_size=img_size, num_methods=len(method_names))
+    state = ckpt.get("model", ckpt)
+    state = _remap_heads(state)
+    model.load_state_dict(state, strict=False)
+    model.eval().to(DEVICE)
 
-        probs_fake = torch.cat(probs_fake).numpy()
-        labels_bin = torch.cat(labels_bin).numpy()
+    tfm = transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    return model, tfm, classes, method_names, img_size, thr
 
-        best_thr, best_bacc = 0.5, 0.0
-        for thr in [i/200 for i in range(80, 121)]:  # 0.40→0.60
-            pred_fake = (probs_fake >= thr).astype(int)
-            y_fake = (labels_bin == 0).astype(int)
-            tp = ((pred_fake==1) & (y_fake==1)).sum()
-            tn = ((pred_fake==0) & (y_fake==0)).sum()
-            fp = ((pred_fake==1) & (y_fake==0)).sum()
-            fn = ((pred_fake==0) & (y_fake==1)).sum()
-            tpr = tp / max(tp+fn, 1); tnr = tn / max(tn+fp, 1)
-            bacc = 0.5*(tpr+tnr)
-            if bacc > best_bacc: best_bacc, best_thr = bacc, thr
+DETECTOR, DET_TFM, CLASSES, METHOD_NAMES, IMG_SIZE, DET_THR = load_detector()
 
-        meth_acc = 0.0
-        if mth_true:
-            mth_true = torch.cat(mth_true).numpy()
-            mth_pred = torch.cat(mth_pred).numpy()
-            meth_acc = float((mth_true == mth_pred).mean())
+# ====================== Inference helpers ======================
+@torch.no_grad()
+def predict_image_tensor(x_chw, tta=2):
+    """
+    x_chw: torch.FloatTensor (C,H,W) normalized
+    return: p_fake(float), p_real(float), pmth(np.ndarray, len=M)
+    """
+    xb = x_chw.unsqueeze(0).to(DEVICE, non_blocking=True)
+    use_amp = (DEVICE.type == "cuda")
+    if use_amp:
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            lb, lm = DETECTOR(xb)
+            if tta and tta >= 2:
+                lb2, lm2 = DETECTOR(torch.flip(xb, dims=[3]))
+                lb = (lb + lb2)/2; lm = (lm + lm2)/2
+    else:
+        lb, lm = DETECTOR(xb)
+        if tta and tta >= 2:
+            lb2, lm2 = DETECTOR(torch.flip(xb, dims=[3]))
+            lb = (lb + lb2)/2; lm = (lm + lm2)/2
 
-        return loss_sum / count, correct / count, best_thr, best_bacc, meth_acc
+    pbin = torch.softmax(lb, dim=1).squeeze(0).cpu().numpy()   # (2,)
+    pmth = torch.softmax(lm, dim=1).squeeze(0).cpu().numpy()   # (M,)
+    return float(pbin[0]), float(pbin[1]), pmth  # P(fake), P(real), method probs
 
-    # ---------- Train ----------
-    def train(self):
-        micro = self.args.micro_batch if self.args.micro_batch > 0 else self.args.batch_size
-        if (self.args.mixup > 0 or self.args.cutmix > 0) and (micro % 2 == 1):
-            micro += 1; print(f"🔧 micro_batch adjusted to even {micro} for mixup/cutmix")
-        accum_steps = max(1, math.ceil(self.args.batch_size / micro))
-        print(f"🧮 Effective batch = {self.args.batch_size} (micro_batch={micro}, accum_steps={accum_steps})")
+def draw_box_np(img_rgb, box, color=(255,0,0), thickness=3):
+    x0,y0,x1,y1 = map(int, box)
+    cv2.rectangle(img_rgb, (x0,y0), (x1,y1), color, thickness)
 
-        remaining_epochs = max(0, self.args.epochs - self.start_epoch)
-        gpm_total = self.steps_per_epoch * self.args.batch_size * remaining_epochs
-        gpm = ProgressMeter(total=gpm_total)
-        print(f"🚀 Bắt đầu train (epochs {self.start_epoch+1}→{self.args.epochs}) | tổng file cần xử lý: {gpm_total}")
+def _render_fake_real_bar(p_fake, p_real):
+    pf = max(0, min(100, int(round(p_fake*100))))
+    pr = max(0, min(100, int(round(p_real*100))))
+    w = 300
+    w_f = int(w * pf/100.0); w_r = w - w_f
+    html = f"""
+    <div style="display:flex;gap:8px;align-items:center">
+      <div style="width:{w}px;height:16px;border-radius:8px;overflow:hidden;border:1px solid #999;display:flex">
+        <div style="width:{w_f}px;background:#d33"></div>
+        <div style="width:{w_r}px;background:#3b7"></div>
+      </div>
+      <div><b>Fake</b> {pf}% &nbsp;|&nbsp; <b>Real</b> {pr}%</div>
+    </div>
+    """
+    return html
 
-        step_global = self.steps_per_epoch * self.start_epoch
-        best_acc = 0.0
+def _make_method_table(pm: np.ndarray):
+    order = np.argsort(-pm)
+    return [[METHOD_NAMES[i], round(float(pm[i]*100.0), 1)] for i in order]
 
-        for epoch in range(self.start_epoch + 1, self.args.epochs + 1):
-            if epoch == self.args.freeze_epochs + 1 and self.frozen:
-                self._unfreeze_all()
+# ====================== Filters per method ======================
+def _unsharp_np(img_rgb, amount=0.6, radius=3):
+    # Gaussian blur rồi cộng dư
+    blur = cv2.GaussianBlur(img_rgb, (0,0), sigmaX=radius)
+    sharp = cv2.addWeighted(img_rgb, 1+amount, blur, -amount, 0)
+    return sharp
 
-            self.model.train()
-            epoch_loss, seen = 0.0, 0
+def _deblock_np(img_rgb, h=3, hColor=3, templateWindowSize=7, searchWindowSize=21):
+    # denoise nhẹ để khử block nén
+    return cv2.fastNlMeansDenoisingColored(img_rgb, None, h, hColor, templateWindowSize, searchWindowSize)
 
-            # Vòng lặp train – bắt KeyboardInterrupt/RuntimeError để lưu interrupt ckpt
-            try:
-                for xb, yb, mb in self.train_loader:
-                    if self.interrupted:
-                        raise KeyboardInterrupt
+def _denoise_np(img_rgb, strength=5):
+    return cv2.bilateralFilter(img_rgb, d=0, sigmaColor=strength, sigmaSpace=strength)
 
-                    bs = xb.size(0)
-                    self.optimizer.zero_grad(set_to_none=True)
+# mapping mặc định filter theo method
+DEFAULT_FILTERS = {
+    "Deepfakes":      ["deblock_light"],
+    "Face2Face":      ["unsharp_light"],
+    "FaceShifter":    ["unsharp_light"],
+    "FaceSwap":       ["unsharp_mid"],
+    "NeuralTextures": ["denoise_verylight", "unsharp_verylight"],
+}
 
-                    for s in range(0, bs, micro):
-                        x = xb[s:s+micro].to(self.device, non_blocking=True)
-                        y = yb[s:s+micro].to(self.device, non_blocking=True)
-                        m = mb[s:s+micro].to(self.device, non_blocking=True)
+def apply_method_filters(pil_img, method_name):
+    img = np.array(pil_img.convert("RGB"))
+    ops = DEFAULT_FILTERS.get(method_name, [])
+    out = img
+    for op in ops:
+        if op == "unsharp_verylight": out = _unsharp_np(out, amount=0.25, radius=1.5)
+        elif op == "unsharp_light":   out = _unsharp_np(out, amount=0.45, radius=2.0)
+        elif op == "unsharp_mid":     out = _unsharp_np(out, amount=0.7,  radius=2.0)
+        elif op == "deblock_light":   out = _deblock_np(out, h=2, hColor=2, templateWindowSize=7, searchWindowSize=21)
+        elif op == "denoise_verylight": out = _denoise_np(out, strength=4)
+    return Image.fromarray(out)
 
-                        used_mix = False
-                        y_soft = None
-                        if self.mixup_fn is not None and random.random() < self.args.mixup_prob:
-                            x, y_soft = self.mixup_fn(x, y)   # y_soft: [B,2]
-                            used_mix = True
+# ====================== Per-method threshold helpers ======================
+def parse_thr_map(s: str, method_names):
+    """
+    'Deepfakes=0.72,Face2Face=0.78,...' -> dict
+    """
+    out = {}
+    if not s: return out
+    items = s.split(",")
+    for it in items:
+        it = it.strip()
+        if not it or "=" not in it: 
+            continue
+        k, v = it.split("=", 1)
+        k = k.strip(); v = v.strip()
+        try:
+            vf = float(v)
+        except:
+            continue
+        # match bất kể hoa/thường
+        for name in method_names:
+            if name.lower() == k.lower():
+                out[name] = vf
+                break
+    return out
 
-                        with torch.amp.autocast('cuda', enabled=(self.device.type=='cuda')):
-                            logits_bin, logits_m = self.model(x)
-                            if used_mix:
-                                loss_bin = self.criterion_bin_soft(logits_bin, y_soft)
-                            else:
-                                loss_bin = self.criterion_bin_hard(logits_bin, y)
-                            loss = loss_bin
-                            if not used_mix:
-                                mask = (m >= 0)
-                                if mask.any():
-                                    loss_m = self.criterion_mth(logits_m[mask], m[mask])
-                                    loss = loss + self.args.method_loss_weight * loss_m
+def get_thr_for_method(global_thr: float, method_name: str, thr_map: dict, gate_ok: bool):
+    if gate_ok and method_name in thr_map:
+        return float(thr_map[method_name])
+    return float(global_thr)
 
-                        epoch_loss += float(loss.detach().item()) * x.size(0)
-                        self.scaler.scale(loss / accum_steps).backward()
+# ====================== Analyze IMAGE ======================
+def analyze_image(pil_img, use_face_crop=True, override_thr=None, tta=2, box_thickness=3,
+                  per_method_thr_map=None, method_gate=0.55, enable_filters=True):
+    img = pil_img.convert("RGB")
+    if use_face_crop:
+        crops, boxes = crop_faces(img, max_faces=5)
+    else:
+        W, H = img.size
+        crops, boxes = [img], [[0, 0, W, H]]
 
-                    self.scaler.step(self.optimizer); self.scaler.update()
-                    if self.ema: self.ema.update(self.model)
+    thr_global = float(override_thr) if (override_thr is not None and not math.isnan(override_thr)) else float(DET_THR)
+    thr_map = per_method_thr_map or {}
+    img_rgb = np.array(img).copy()
 
-                    step_global += 1
-                    lr_scale = cosine_warmup(step_global, self.total_steps, self.args.warmup_steps)
-                    for pg in self.optimizer.param_groups: pg['lr'] = self.args.lr * lr_scale
-                    lr_now = self.optimizer.param_groups[0]['lr']
+    best = {
+        "p_fake": -1.0, "p_real": -1.0, "box": None, "m_idx": None, "pm": None,
+        "p_fake_orig": -1.0, "p_fake_filt": -1.0
+    }
 
-                    seen += bs; gpm.step(bs)
-                    print(f"\r[Epoch {epoch}/{self.args.epochs}] {gpm.text()} | lr {lr_now:.2e}", end="")
+    for crop, box in zip(crops, boxes):
+        x = DET_TFM(crop)
+        p_fake0, p_real0, pm0 = predict_image_tensor(x, tta=tta)
+        m_idx0 = int(np.argmax(pm0)); m_name0 = METHOD_NAMES[m_idx0]; m_conf0 = float(pm0[m_idx0])
 
-            except KeyboardInterrupt:
-                # người dùng nhấn Ctrl+C -> lưu interrupt ckpt, thoát sạch
-                print("\n⏸ Bị ngắt bởi người dùng.")
-                self.save_ckpt(f"epoch{epoch}_interrupt", epoch=epoch)
-                print("✅ Đã lưu checkpoint tạm. Thoát.")
-                return
-            except RuntimeError as e:
-                # khi Ctrl+C, đôi khi DataLoader ném lỗi “worker exited unexpectedly”
-                if self.interrupted and ("DataLoader worker" in str(e) or "_queue.Empty" in str(e)):
-                    print("\n⏸ Bị ngắt giữa chừng (DataLoader).")
-                    self.save_ckpt(f"epoch{epoch}_interrupt", epoch=epoch)
-                    print("✅ Đã lưu checkpoint tạm. Thoát.")
-                    return
-                else:
-                    raise
+        # có dùng filter không?
+        p_fake_filt, p_real_filt, pm_filt = -1.0, -1.0, None
+        if enable_filters and m_conf0 >= method_gate:
+            crop_f = apply_method_filters(crop, m_name0)
+            x2 = DET_TFM(crop_f)
+            p_fake_filt, p_real_filt, pm_filt = predict_image_tensor(x2, tta=tta)
 
-            print()
-            val_loss, val_acc, thr, bacc, meth_acc = self.evaluate(use_ema=True, tta=True)
-            train_loss = epoch_loss / max(seen, 1)
-            print(f"Epoch {epoch}/{self.args.epochs} | train_loss {train_loss:.4f} | "
-                  f"val_loss {val_loss:.4f} | val_acc {val_acc:.4f} | best_thr {thr:.3f} "
-                  f"| val_bacc {bacc:.4f} | meth_acc(fake) {meth_acc:.4f}")
+        # lấy pass tốt hơn (ưu tiên fake score cao hơn)
+        if p_fake_filt > p_fake0:
+            p_fake_use, p_real_use, pm_use, m_idx_use = p_fake_filt, p_real_filt, (pm_filt if pm_filt is not None else pm0), int(np.argmax(pm_filt if pm_filt is not None else pm0))
+        else:
+            p_fake_use, p_real_use, pm_use, m_idx_use = p_fake0, p_real0, pm0, m_idx0
 
-            self.best["threshold"] = thr
-            self.save_ckpt(f"epoch{epoch}",
-                           extra_meta={"threshold": thr, "val_acc": val_acc, "val_bacc": bacc,
-                                       "val_method_acc": meth_acc}, epoch=epoch)
+        if p_fake_use > best["p_fake"]:
+            best.update({
+                "p_fake": p_fake_use, "p_real": p_real_use, "box": box, "m_idx": m_idx_use, "pm": pm_use,
+                "p_fake_orig": p_fake0, "p_fake_filt": p_fake_filt
+            })
 
-            if val_acc > best_acc:
-                best_acc = val_acc
-                self.best.update({"acc": best_acc, "threshold": thr})
-                self.save_ckpt("best",
-                               extra_meta={"threshold": thr, "val_acc": val_acc, "val_bacc": bacc,
-                                           "val_method_acc": meth_acc}, epoch=epoch)
+    # Render bar & method table
+    fr_bar_html = _render_fake_real_bar(best["p_fake"], best["p_real"])
+    method_rows = _make_method_table(best["pm"]) if best["pm"] is not None else []
 
-        print(f"✅ Train xong. Best val_acc = {self.best['acc']:.4f} | threshold={self.best['threshold']:.3f}")
+    # Quy tắc: FAKE nếu p_fake >= thr_eff (theo method-top & gate)
+    verdict = "Không phát hiện khuôn mặt."
+    if best["box"] is not None:
+        m_name = METHOD_NAMES[best["m_idx"]] if best["m_idx"] is not None else "Unknown"
+        m_conf = float(best["pm"][best["m_idx"]]) if best["pm"] is not None and best["m_idx"] is not None else 0.0
+        gate_ok = (m_conf >= float(method_gate))
+        thr_eff = get_thr_for_method(thr_global, m_name, thr_map, gate_ok)
+        label = "FAKE" if best["p_fake"] >= thr_eff else "REAL"
+        color = (223, 64, 64) if label=="FAKE" else (64, 208, 120)
+        draw_box_np(img_rgb, best["box"], color=color, thickness=int(box_thickness))
+        verdict = f"{label} | top-method: {m_name} ({m_conf:.2f}) | thr_eff={thr_eff:.3f} | p_fake={best['p_fake']:.3f}"
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data_root", type=str, default="data/processed/faces")
-    p.add_argument("--out_dir", type=str, default="deepfake_detector")
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch_size", type=int, default=100)
-    p.add_argument("--micro_batch", type=int, default=0, help="chia nhỏ batch để tránh OOM; effective = batch_size")
-    p.add_argument("--img_size", type=int, default=384)
-    p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--mixup", type=float, default=0.15)
-    p.add_argument("--cutmix", type=float, default=0.15)
-    p.add_argument("--mixup_prob", type=float, default=0.7)
-    p.add_argument("--label_smoothing", type=float, default=0.05)
-    p.add_argument("--ema", action="store_true", default=True)
-    p.add_argument("--warmup_steps", type=int, default=600)
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--grad_ckpt",    dest="grad_ckpt", action="store_true")
-    g.add_argument("--no_grad_ckpt", dest="grad_ckpt", action="store_false")
-    p.set_defaults(grad_ckpt=True)  # như bản trước: mặc định bật
-    p.add_argument("--model", type=str, default="vit_base_patch16_224")
-    p.add_argument("--freeze_epochs", type=int, default=2)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--balance_by_method", action="store_true")
-    p.add_argument("--method_boost", type=str, default="", help='VD: "Face2Face=2,FaceShifter=2,NeuralTextures=2,FaceSwap=1.5"')
-    p.add_argument("--face_crop", action="store_true")
-    p.add_argument("--method_loss_weight", type=float, default=0.3)
+    out_img = Image.fromarray(img_rgb)
+    return out_img, verdict, fr_bar_html, method_rows
 
-    # resume
-    p.add_argument("--resume", type=str, default="", help="path tới checkpoint để tiếp tục")
-    p.add_argument("--auto_resume", action="store_true", help="tự chọn checkpoint mới nhất khi --resume rỗng")
-    p.add_argument("--reset_opt", action="store_true", help="khởi tạo optimizer mới khi resume (tiếp từ epoch+1)")
+# ====================== Analyze VIDEO ======================
+def analyze_video(video_path, use_face_crop=True, override_thr=None, tta=2, box_thickness=3,
+                  per_method_thr_map=None, method_gate=0.55, enable_filters=True):
+    thr_global = float(override_thr) if (override_thr is not None and not math.isnan(override_thr)) else float(DET_THR)
+    thr_map = per_method_thr_map or {}
 
-    args = p.parse_args()
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return None, "Không mở được video.", "", []
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25
 
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("high")
-    set_seed(args.seed)
+    # Writer
+    tmpdir = tempfile.mkdtemp(prefix="df_web_")
+    out_path = os.path.join(tmpdir, "out.mp4")
+    if HAS_IMAGEIO:
+        writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=7)
+    else:
+        writer = None
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vout = cv2.VideoWriter(out_path, fourcc, fps, (w,h))
 
-    t = Trainer(args)
-    t.build_data(); t.build_model(); t.maybe_resume(); t.train()
+    sum_pfake = 0.0; sum_preal = 0.0; n_frames = 0
+    pm_sum_all = np.zeros(len(METHOD_NAMES), dtype=np.float64)
+    pm_sum_fake = np.zeros(len(METHOD_NAMES), dtype=np.float64)
+    n_fake_frames = 0
 
-if __name__ == "__main__":
-    main()
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(frame_rgb)
+
+        if use_face_crop:
+            crops, boxes = crop_faces(pil, max_faces=5)
+        else:
+            crops, boxes = [pil], [[0,0,w,h]]
+
+        best = {"p_fake":-1.0, "p_real":-1.0, "box":None, "m_idx":None, "pm":None}
+        for crop, box in zip(crops, boxes):
+            x = DET_TFM(crop)
+            p_fake0, p_real0, pm0 = predict_image_tensor(x, tta=tta)
+            m_idx0 = int(np.argmax(pm0)); m_name0 = METHOD_NAMES[m_idx0]; m_conf0 = float(pm0[m_idx0])
+
+            p_fake_filt, p_real_filt, pm_filt = -1.0, -1.0, None
+            if enable_filters and m_conf0 >= float(method_gate):
+                crop_f = apply_method_filters(crop, m_name0)
+                x2 = DET_TFM(crop_f)
+                p_fake_filt, p_real_filt, pm_filt = predict_image_tensor(x2, tta=tta)
+
+            if p_fake_filt > p_fake0:
+                p_fake_use, p_real_use, pm_use, m_idx_use = p_fake_filt, p_real_filt, (pm_filt if pm_filt is not None else pm0), int(np.argmax(pm_filt if pm_filt is not None else pm0))
+            else:
+                p_fake_use, p_real_use, pm_use, m_idx_use = p_fake0, p_real0, pm0, m_idx0
+
+            if p_fake_use > best["p_fake"]:
+                best.update({"p_fake":p_fake_use, "p_real":p_real_use, "box":box, "m_idx":m_idx_use, "pm":pm_use})
+
+        # accumulate stats
+        sum_pfake += best["p_fake"]; sum_preal += best["p_real"]; n_frames += 1
+        if best["pm"] is not None:
+            pm_sum_all += best["pm"]
+        # quyết định frame fake theo thr hiệu dụng (gate + method thr)
+        if best["m_idx"] is not None and best["pm"] is not None:
+            m_name = METHOD_NAMES[best["m_idx"]]; m_conf = float(best["pm"][best["m_idx"]])
+            thr_eff = get_thr_for_method(thr_global, m_name, thr_map, m_conf >= float(method_gate))
+        else:
+            thr_eff = thr_global
+        is_fake = (best["p_fake"] >= thr_eff)
+        if is_fake:
+            n_fake_frames += 1
+            if best["pm"] is not None: pm_sum_fake += best["pm"]
+
+        # draw & write
+        color = (223,64,64) if is_fake else (64,208,120)
+        if best["box"] is not None:
+            draw_box_np(frame_rgb, best["box"], color=color, thickness=int(box_thickness))
+        out_frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        if HAS_IMAGEIO:
+            writer.append_data(cv2.cvtColor(out_frame_bgr, cv2.COLOR_BGR2RGB))
+        else:
+            vout.write(out_frame_bgr)
+
+    cap.release()
+    if HAS_IMAGEIO:
+        writer.close()
+    else:
+        vout.release()
+
+    pf = sum_pfake/max(1,n_frames); pr = sum_preal/max(1,n_frames)
+    fr_bar_html = _render_fake_real_bar(pf, pr)
+    # bảng phương pháp
+    if n_fake_frames > 0:
+        pm = pm_sum_fake / max(1, pm_sum_fake.sum())
+    else:
+        pm = pm_sum_all / max(1, pm_sum_all.sum()) if pm_sum_all.sum() > 0 else np.zeros_like(pm_sum_all)
+    method_rows = _make_method_table(pm)
+
+    verdict = f"Frames: {n_frames} | Fake-frames: {n_fake_frames} ({(100.0*n_fake_frames/max(1,n_frames)):.1f}%)"
+    return out_path, verdict, fr_bar_html, method_rows
+
+# ====================== Gradio UI ======================
+def _img_wrap(img: Image.Image, fc: bool, thr: float, tta: int, thick: int,
+              pm_thr_str: str, method_gate: float, enable_filters: bool):
+    if img is None:
+        return None, "Chưa chọn ảnh.", "", []
+    pm_map = parse_thr_map(pm_thr_str, METHOD_NAMES)
+    out_img, verdict, fr_bar_html, method_rows = analyze_image(
+        img, use_face_crop=bool(fc), override_thr=float(thr), tta=int(tta), box_thickness=int(thick),
+        per_method_thr_map=pm_map, method_gate=float(method_gate), enable_filters=bool(enable_filters)
+    )
+    return out_img, verdict, fr_bar_html, method_rows
+
+def _vid_wrap(vid_path: str, fc: bool, thr: float, tta: int, thick: int,
+              pm_thr_str: str, method_gate: float, enable_filters: bool):
+    if not vid_path:
+        return None, "Chưa chọn video.", "", []
+    pm_map = parse_thr_map(pm_thr_str, METHOD_NAMES)
+    out_path, verdict, fr_bar_html, method_rows = analyze_video(
+        vid_path, use_face_crop=bool(fc), override_thr=float(thr), tta=int(tta), box_thickness=int(thick),
+        per_method_thr_map=pm_map, method_gate=float(method_gate), enable_filters=bool(enable_filters)
+    )
+    return out_path, verdict, fr_bar_html, method_rows
+
+# ====================== App ======================
+thr_default = float(CLI_THR) if (CLI_THR is not None and not math.isnan(CLI_THR)) else float(DET_THR)
+pm_thr_default = CLI_PM_THR_STR or "Deepfakes=0.72,Face2Face=0.78,FaceShifter=0.76,FaceSwap=0.78,NeuralTextures=0.62"
+gate_default = float(CLI_METHOD_GATE)
+filt_default = bool(CLI_ENABLE_FILTERS)
+
+with gr.Blocks(title="Deepfake Detect (UI)") as demo:
+    gr.Markdown("## Deepfake Detect (UI) — threshold theo từng method + filter sau phân loại")
+    with gr.Row():
+        with gr.Column():
+            face_crop = gr.Checkbox(label="Face crop", value=True)
+            thr = gr.Slider(0.0, 0.99, value=thr_default, step=0.005, label="Global threshold (fake ≥ thr ⇒ FAKE)")
+            tta = gr.Slider(1, 4, value=2, step=1, label="TTA (1/2/3/4)")
+            thick = gr.Slider(1, 8, value=3, step=1, label="Độ dày khung")
+        with gr.Column():
+            pm_thr_str = gr.Textbox(label="Per-method threshold (vd: Deepfakes=0.72,Face2Face=0.78,FaceShifter=0.76,FaceSwap=0.78,NeuralTextures=0.62)", value=pm_thr_default)
+            method_gate = gr.Slider(0.0, 1.0, value=gate_default, step=0.01, label="Method gate (>= gate mới dùng thr riêng & filter)")
+            enable_filters = gr.Checkbox(label="Bật filter theo method (unsharp/deblock/denoise)", value=filt_default)
+        with gr.Column():
+            gr.Markdown(f"**Model**: {type(DETECTOR.backbone).__name__}  \n**img={IMG_SIZE}**  \n**Classes**: {CLASSES}  \n**Methods**: {', '.join(METHOD_NAMES)}")
+
+    gr.Markdown("### Detect ảnh")
+    with gr.Row():
+        in_img = gr.Image(type="pil", label="Ảnh nguồn")
+        out_img = gr.Image(type="pil", label="Ảnh đã phân tích")
+    img_text = gr.Textbox(label="Kết luận", interactive=False)
+    fr_bar_img = gr.HTML(label="Tỉ lệ Fake/Real")
+    method_df_img = gr.Dataframe(headers=["Method", "%"], datatype=["str","number"], interactive=False, label="Tỉ lệ theo phương pháp (descending)")
+    btn_img = gr.Button("Phân tích Ảnh")
+    btn_img.click(_img_wrap, [in_img, face_crop, thr, tta, thick, pm_thr_str, method_gate, enable_filters], [out_img, img_text, fr_bar_img, method_df_img])
+
+    gr.Markdown("### Detect video")
+    with gr.Row():
+        in_vid = gr.Video(label="Video nguồn")
+        out_vid = gr.Video(label="Video đã phân tích (xem trực tiếp)")
+    vid_text = gr.Textbox(label="Nhật ký", interactive=False)
+    fr_bar_vid = gr.HTML(label="Tỉ lệ Fake/Real (video)")
+    method_df_vid = gr.Dataframe(headers=["Method", "%"], datatype=["str","number"], interactive=False, label="Tỉ lệ theo phương pháp (descending)")
+    btn_vid = gr.Button("Phân tích Video")
+    btn_vid.click(_vid_wrap, [in_vid, face_crop, thr, tta, thick, pm_thr_str, method_gate, enable_filters], [out_vid, vid_text, fr_bar_vid, method_df_vid])
+
+demo.launch(server_name="127.0.0.1", server_port=7860, share=False)

@@ -12,3 +12,4 @@ deepfake_generator/__pycache__/
 *.pt
 *.h5
 *.pyc
+*.log

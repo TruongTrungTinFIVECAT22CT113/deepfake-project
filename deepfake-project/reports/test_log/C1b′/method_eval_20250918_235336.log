@@ -1,0 +1,11 @@
+data/processed/faces/val/fake\Deepfakes | N= 23931 | det_fake= 10473 ( 43.8%) | correct= 10211 ( 42.7%) | wrong=   262 | missed= 13458 | time=10.81 min | 36.9 img/s
+   → nhầm nhiều sang: Face2Face:115, FaceSwap:99, FaceShifter:28, NeuralTextures:20
+data/processed/faces/val/fake\Face2Face | N= 10301 | det_fake=  1227 ( 11.9%) | correct=   504 (  4.9%) | wrong=   723 | missed=  9074 | time=3.07 min | 55.9 img/s
+   → nhầm nhiều sang: Deepfakes:467, FaceSwap:194, FaceShifter:59, NeuralTextures:3
+data/processed/faces/val/fake\FaceShifter | N=  9732 | det_fake=  1107 ( 11.4%) | correct=   279 (  2.9%) | wrong=   828 | missed=  8625 | time=2.82 min | 57.6 img/s
+   → nhầm nhiều sang: Deepfakes:420, FaceSwap:297, Face2Face:107, NeuralTextures:4
+data/processed/faces/val/fake\FaceSwap | N=  8301 | det_fake=  1157 ( 13.9%) | correct=   525 (  6.3%) | wrong=   632 | missed=  7144 | time=2.45 min | 56.5 img/s
+   → nhầm nhiều sang: Deepfakes:516, Face2Face:62, FaceShifter:52, NeuralTextures:2
+data/processed/faces/val/fake\NeuralTextures | N=  8368 | det_fake=   459 (  5.5%) | correct=    20 (  0.2%) | wrong=   439 | missed=  7909 | time=2.77 min | 50.3 img/s
+   → nhầm nhiều sang: Deepfakes:313, FaceSwap:77, Face2Face:28, FaceShifter:21
+[Done] total_time=21.93 min

@@ -1,0 +1,9 @@
+CKPT: deepfake_detector/checkpoints/detector_best_calib.pt | img=512 | Thr=0.760 | TTA=1 | face_crop=True
+
+N=10246 | pred_real=7518 (73.37%) | pred_fake=2728 (26.63%) | time=4.81 min | 35.5 img/s
+Misclassified as methods (top):
+  - Deepfakes: 2175
+  - FaceSwap: 279
+  - FaceShifter: 154
+  - Face2Face: 106
+  - NeuralTextures: 14

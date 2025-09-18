@@ -1,318 +1,205 @@
-# eval_method_detailed.py
-import os, sys, time, math, csv, argparse, glob, gc
-from collections import Counter
-from typing import List, Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-import numpy as np
+# -*- coding: utf-8 -*-
+import os, time, argparse, math, csv, sys
+from glob import glob
 from PIL import Image
-import torch
-import torch.nn as nn
-import timm
+import numpy as np
+import torch, torch.nn as nn
 from torchvision import transforms
 from tqdm import tqdm
 
-torch.backends.cudnn.benchmark = True
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ---------- optional: memory log ----------
-def _try_mem():
-    used_vram = None
-    if torch.cuda.is_available():
-        used_vram = torch.cuda.memory_allocated() / (1024**2)
-    try:
-        import psutil
-        used_ram = psutil.Process(os.getpid()).memory_info().rss / (1024**2)
-    except Exception:
-        used_ram = None
-    return used_vram, used_ram
-
-# ---------- Face crop (Mediapipe) ----------
-_FACE_DET = None
-def _lazy_face_det():
-    global _FACE_DET
-    if _FACE_DET is None:
-        try:
-            import mediapipe as mp
-            _FACE_DET = mp.solutions.face_detection.FaceDetection(
-                model_selection=0, min_detection_confidence=0.3
-            )
-        except Exception:
-            _FACE_DET = False
-    return _FACE_DET
-
-def detect_faces_xyxy(img_rgb: np.ndarray) -> List[List[int]]:
-    det = _lazy_face_det()
-    H, W, _ = img_rgb.shape
-    boxes = []
-    if not det:
-        return boxes
-    res = det.process(img_rgb[..., ::-1])  # mediapipe expects BGR
-    if not res or not getattr(res, "detections", None):
-        return boxes
-    for d in res.detections:
-        r = d.location_data.relative_bounding_box
-        x0 = int(max(0, r.xmin * W)); y0 = int(max(0, r.ymin * H))
-        x1 = int(min(W, (r.xmin + r.width) * W))
-        y1 = int(min(H, (r.ymin + r.height) * H))
-        if x1 > x0 and y1 > y0:
-            boxes.append([x0, y0, x1, y1])
-    return boxes
-
-def crop_main_face(pil_img: Image.Image, expand: float = 0.25) -> Image.Image:
-    # trả về crop mặt lớn nhất; nếu không thấy mặt thì trả full ảnh
-    img_rgb = np.array(pil_img.convert("RGB"))
-    H, W = img_rgb.shape[:2]
-    boxes = detect_faces_xyxy(img_rgb)
-    if not boxes:
-        return pil_img
-    boxes = sorted(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]), reverse=True)
-    x0, y0, x1, y1 = boxes[0]
-    dx = int((x1-x0)*expand); dy = int((y1-y0)*expand)
-    xx0 = max(0, x0-dx); yy0 = max(0, y0-dy)
-    xx1 = min(W, x1+dx); yy1 = min(H, y1+dy)
-    return Image.fromarray(img_rgb[yy0:yy1, xx0:xx1])
-
-# ---------- Model ----------
-class MultiHeadViT(nn.Module):
-    def __init__(self, backbone="vit_base_patch16_224", img_size=224, num_methods=6):
-        super().__init__()
-        self.backbone = timm.create_model(backbone, pretrained=False, num_classes=0, img_size=img_size)
-        feat = self.backbone.num_features
-        self.dropout = nn.Dropout(0.1)
-        self.head_bin = nn.Linear(feat, 2)           # fake/real
-        self.head_m  = nn.Linear(feat, num_methods)  # method classes
-
-    def forward(self, x):
-        f = self.backbone(x)
-        f = self.dropout(f)
-        return self.head_bin(f), self.head_m(f)
-
-def _remap_heads(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+# ---------- utils: load ckpt ----------
+def _remap_heads(state):
     out = {}
-    for k, v in state.items():
+    for k,v in state.items():
         if k.startswith("head_cls."):
-            out[k.replace("head_cls.", "head_bin.")] = v
+            out[k.replace("head_cls.","head_bin.")] = v
         elif k.startswith("head_mth."):
-            out[k.replace("head_mth.", "head_m.")] = v
+            out[k.replace("head_mth.","head_m.")] = v
         else:
             out[k] = v
     return out
 
-def load_detector(ckpt_path: str):
+class MultiHeadViT(nn.Module):
+    def __init__(self, backbone, feat_dim, num_methods):
+        super().__init__()
+        self.backbone = backbone
+        self.head_bin = nn.Linear(feat_dim, 2)
+        self.head_m   = nn.Linear(feat_dim, num_methods)
+    def forward(self, x):
+        f = self.backbone(x)
+        return self.head_bin(f), self.head_m(f)
+
+def load_backbone(model_name="vit_base_patch16_224", img_size=512, drop_rate=0.0):
+    import timm
+    last_err = None
+    for kw in [
+        dict(pretrained=False, num_classes=0, drop_rate=drop_rate, img_size=img_size),
+        dict(pretrained=False, num_classes=0, drop_rate=drop_rate),
+        dict(pretrained=False, num_classes=0),
+    ]:
+        try:
+            m = timm.create_model(model_name, **kw)
+            return m, m.num_features
+        except TypeError as e:
+            last_err = e
+    raise RuntimeError(f"Cannot create backbone: {last_err}")
+
+def load_detector(ckpt_path, device):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     meta = ckpt.get("meta", {})
     classes = meta.get("classes", ["fake","real"])
-    method_names = meta.get("method_names", ["Deepfakes","Face2Face","FaceShifter","FaceSwap","NeuralTextures","Other"])
-    mean = meta.get("norm_mean", [0.5,0.5,0.5])
-    std  = meta.get("norm_std",  [0.5,0.5,0.5])
+    methods = meta.get("method_names", ["Deepfakes","Face2Face","FaceShifter","FaceSwap","NeuralTextures","Other"])
+    mean = meta.get("norm_mean", [0.5,0.5,0.5]); std = meta.get("norm_std", [0.5,0.5,0.5])
     thr  = float(meta.get("threshold", 0.5))
     model_name = meta.get("model_name", "vit_base_patch16_224")
     img_size   = int(meta.get("img_size", 224))
 
-    model = MultiHeadViT(model_name, img_size=img_size, num_methods=len(method_names))
-    state = ckpt.get("model_ema") or ckpt.get("model") or ckpt
-    state = _remap_heads(state)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[WARN] load_state_dict missing= {list(missing)} unexpected= {list(unexpected)}")
-    model.to(DEVICE).eval()
+    bb, feat = load_backbone(model_name, img_size)
+    model = MultiHeadViT(bb, feat, len(methods))
+    state = _remap_heads(ckpt.get("model", ckpt))
+    model.load_state_dict(state, strict=False)
+    model.eval().to(device)
 
     tfm = transforms.Compose([
-        transforms.Resize((img_size, img_size)),
+        transforms.Resize((img_size, img_size), transforms.InterpolationMode.BICUBIC),
         transforms.ToTensor(),
-        transforms.Normalize(mean, std)
+        transforms.Normalize(mean, std),
     ])
-    return model, tfm, classes, method_names, img_size, thr
+    return model, tfm, classes, methods, img_size, thr
 
 @torch.no_grad()
-def predict_batch(model, xb: torch.Tensor, tta: int = 2, amp: bool = True):
-    # xb: (B,3,H,W) on DEVICE -> pbin(B,2), pmth(B,M)
-    if amp and DEVICE.type == "cuda":
+def predict_p(img: Image.Image, tfm, model, device, tta=2, idx_fake=0, idx_real=1):
+    x = tfm(img).unsqueeze(0).to(device)
+    use_amp = (device.type=="cuda")
+    if use_amp:
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            lb, lm = model(xb)
-            if tta >= 2:
-                lb2, lm2 = model(torch.flip(xb, dims=[3]))
-                lb = (lb + lb2) / 2
-                lm = (lm + lm2) / 2
+            lb, lm = model(x)
+            if tta and tta>=2:
+                lb2, lm2 = model(torch.flip(x, dims=[3]))
+                lb = (lb+lb2)/2; lm=(lm+lm2)/2
     else:
-        lb, lm = model(xb)
-        if tta >= 2:
-            lb2, lm2 = model(torch.flip(xb, dims=[3]))
-            lb = (lb + lb2) / 2
-            lm = (lm + lm2) / 2
-    pbin = torch.softmax(lb, dim=1).cpu().numpy()
-    pmth = torch.softmax(lm, dim=1).cpu().numpy()
-    return pbin, pmth
+        lb, lm = model(x)
+        if tta and tta>=2:
+            lb2, lm2 = model(torch.flip(x, dims=[3]))
+            lb = (lb+lb2)/2; lm=(lm+lm2)/2
+    pbin = torch.softmax(lb, dim=1).squeeze(0).cpu().numpy()
+    pm   = torch.softmax(lm, dim=1).squeeze(0).cpu().numpy()
+    p_fake = float(pbin[idx_fake])
+    p_real = float(pbin[idx_real])
+    return p_fake, p_real, pm
 
-# ---------- Eval per-method ----------
-IMG_EXTS = {".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
-
-def collect_images(root_dir: str) -> Dict[str, List[str]]:
+def parse_thr_map(s: str, methods):
     out = {}
-    for name in sorted(os.listdir(root_dir)):
-        p = os.path.join(root_dir, name)
-        if not os.path.isdir(p):
-            continue
-        imgs = []
-        for ext in IMG_EXTS:
-            imgs += glob.glob(os.path.join(p, f"*{ext}"))
-        if imgs:
-            out[p] = imgs
+    if not s: return out
+    for it in s.split(","):
+        it = it.strip()
+        if not it or "=" not in it: continue
+        k,v = it.split("=",1)
+        k=k.strip(); v=v.strip()
+        try: v=float(v)
+        except: continue
+        for name in methods:
+            if name.lower()==k.lower():
+                out[name]=v; break
     return out
 
-def normalize_method_name(name: str) -> str:
-    n = os.path.basename(name).strip().lower()
-    alias = {
-        "deepfake": "deepfakes", "deepfakedetection":"deepfakes", "deepfakes":"deepfakes",
-        "face2face":"face2face", "faceshifter":"faceshifter", "faceswap":"faceswap",
-        "neuraltexture":"neuraltextures", "neuraltextures":"neuraltextures", "other":"other",
-    }
-    return alias.get(n, n)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", required=True)
+    ap.add_argument("--root", required=True, help="data/processed/faces/val/fake")
+    ap.add_argument("--tta", type=int, default=2)
+    ap.add_argument("--face_crop", action="store_true")  # giữ để tương thích, nhưng thư mục đã là mặt
+    ap.add_argument("--threshold", type=float, default=None)
+    ap.add_argument("--per_method_thr", type=str, default="")
+    ap.add_argument("--method_gate", type=float, default=0.55)
+    ap.add_argument("--out_csv", type=str, default=None)
+    ap.add_argument("--out_log", type=str, default=None)
+    ap.add_argument("--workers", type=int, default=0)
+    ap.add_argument("--batch", type=int, default=0) # chưa dùng; đọc ảnh tuần tự để ổn định
+    ap.add_argument("--log_every", type=int, default=1000)
+    args = ap.parse_args()
 
-def _load_one(path: str, tfm, face_crop: bool):
-    try:
-        with Image.open(path) as img:
-            img = img.convert("RGB")
-            if face_crop:
-                img = crop_main_face(img)
-            return tfm(img)
-    except Exception:
-        return None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, tfm, classes, methods, img_size, thr_meta = load_detector(args.ckpt, device)
+    assert "fake" in classes and "real" in classes, f"classes={classes}"
+    idx_fake = classes.index("fake"); idx_real = classes.index("real")
 
-def chunked(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i+n]
+    thr_global = float(args.threshold) if args.threshold is not None else float(thr_meta)
+    thr_map = parse_thr_map(args.per_method_thr, methods)
+    gate = float(args.method_gate)
 
-def run_eval(args):
-    model, tfm, classes, method_names, img_size, thr_ckpt = load_detector(args.ckpt)
-    thr = float(args.threshold) if args.threshold is not None else thr_ckpt
+    method_dirs = [(m, os.path.join(args.root, m)) for m in methods if os.path.isdir(os.path.join(args.root, m))]
+    if not method_dirs:
+        # fallback: mọi thư mục con
+        method_dirs = [(os.path.basename(p), p) for p in sorted(glob(os.path.join(args.root,"*"))) if os.path.isdir(p)]
 
-    # ép workers=0 khi dùng face_crop để tránh Mediapipe ăn RAM/không thread-safe
-    workers = args.workers
-    if args.face_crop and workers > 0:
-        print("[WARN] --face_crop bật → ép --workers 0 để tránh Mediapipe ngốn RAM / lỗi thread.")
-        workers = 0
+    total_imgs = 0
+    for _,p in method_dirs: total_imgs += len(glob(os.path.join(p,"*.png"))) + len(glob(os.path.join(p,"*.jpg"))) + len(glob(os.path.join(p,"*.jpeg")))
 
-    print(f"== CKPT: {args.ckpt} | Model={model.backbone.__class__.__name__} | img={img_size} | "
-          f"Thr={thr:.3f} | TTA={args.tta} | face_crop={args.face_crop} | batch={args.batch} | workers={workers}")
+    t0 = time.time()
+    rows = []
+    log_lines = []
+    for mname,mdir in method_dirs:
+        paths = []
+        for ext in ("*.png","*.jpg","*.jpeg","*.bmp","*.webp"):
+            paths += glob(os.path.join(mdir, ext))
+        n = len(paths)
+        if n==0: continue
 
-    meta_map = {normalize_method_name(m): i for i, m in enumerate(method_names)}
-    all_dirs = collect_images(args.root)
-    if not all_dirs:
-        print(f"[!] Không tìm thấy ảnh ở: {args.root}")
-        return
-
-    os.makedirs("reports", exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    csv_path = os.path.join("reports", f"method_eval_{ts}.csv")
-
-    with open(csv_path, "w", newline="", encoding="utf-8") as fcsv:
-        wr = csv.writer(fcsv)
-        wr.writerow(["method_dir","meta_label","N","det_fake","correct_method","wrong_method","missed_real","acc_fake","acc_method_overall"])
-
-        for method_dir, img_paths in all_dirs.items():
-            target_key = normalize_method_name(method_dir)
-            m_idx = meta_map.get(target_key, None)
-            if m_idx is None:
-                print(f"[WARN] Bỏ qua '{method_dir}' vì không khớp meta labels {method_names}")
-                continue
-
-            N = len(img_paths)
-            det_fake = 0; correct_method = 0; wrong_method = 0; missed_real = 0
-            conf_wrong = Counter()
-
-            # progress bar theo folder
-            pbar = tqdm(total=N, desc=os.path.basename(method_dir), unit="img")
-
-            # ThreadPoolExecutor: chỉ tạo 1 lần / folder khi KHÔNG face_crop
-            executor = None
-            if workers > 0:
-                executor = ThreadPoolExecutor(max_workers=workers)
-
+        t_m0 = time.time()
+        det_fake = 0; correct = 0; wrong = 0; missed = 0
+        confmix = {}
+        pbar = tqdm(total=n, desc=mname, ncols=100)
+        for i, p in enumerate(paths):
             try:
-                for batch_idx, paths in enumerate(chunked(img_paths, args.batch), 1):
-                    # load song song nếu executor != None
-                    if executor is not None:
-                        xs = [None] * len(paths)
-                        futures = {executor.submit(_load_one, p, tfm, args.face_crop): i for i, p in enumerate(paths)}
-                        for fut in as_completed(futures):
-                            i = futures[fut]
-                            xs[i] = fut.result()
-                    else:
-                        xs = [_load_one(p, tfm, args.face_crop) for p in paths]
+                img = Image.open(p).convert("RGB")
+            except:
+                missed += 1; pbar.update(1); continue
+            p_fake, p_real, pm = predict_p(img, tfm, model, device, tta=args.tta, idx_fake=idx_fake, idx_real=idx_real)
+            m_idx = int(np.argmax(pm)); m_conf = float(pm[m_idx]); m_pred = methods[m_idx]
+            thr_eff = thr_map.get(m_pred, thr_global) if m_conf >= gate else thr_global
+            is_fake = (p_fake >= thr_eff)
+            if is_fake:
+                det_fake += 1
+                if m_pred == mname:
+                    correct += 1
+                else:
+                    wrong += 1
+                    confmix[m_pred] = confmix.get(m_pred, 0) + 1
+            else:
+                missed += 1
+            pbar.update(1)
+        pbar.close()
+        dt = time.time() - t_m0
+        ips = n / dt if dt>0 else 0.0
+        top_conf = sorted(confmix.items(), key=lambda x: -x[1])[:4]
+        log_lines.append(f"{mdir} | N={n:6d} | det_fake={det_fake:6d} ({det_fake/n*100:5.1f}%) | correct={correct:6d} ({correct/n*100:5.1f}%) | wrong={wrong:6d} | missed={missed:6d} | time={dt/60:.2f} min | {ips:.1f} img/s")
+        if top_conf:
+            top_s = ", ".join([f"{k}:{v}" for k,v in top_conf])
+            log_lines.append(f"   → nhầm nhiều sang: {top_s}")
 
-                    # lọc ảnh đọc lỗi
-                    keep_tensors = [x for x in xs if x is not None]
-                    missed_real += (len(xs) - len(keep_tensors))
-                    if not keep_tensors:
-                        pbar.update(len(paths))
-                        continue
+        rows.append([mname, n,
+                     round(det_fake/n,4), round(correct/n,4), wrong, missed,
+                     round(ips,2)])
 
-                    xb = torch.stack(keep_tensors, dim=0).to(DEVICE, non_blocking=True)
-                    pbin, pmth = predict_batch(model, xb, tta=args.tta, amp=(not args.no_amp))
+    total_dt = time.time() - t0
+    # print summary
+    for ln in log_lines: print(ln)
+    print(f"\n[Done] total_time={total_dt/60:.2f} min")
 
-                    for pf, pm in zip(pbin, pmth):
-                        p_fake = float(pf[0])
-                        if p_fake >= thr:
-                            det_fake += 1
-                            pred_m = int(np.argmax(pm))
-                            if pred_m == m_idx:
-                                correct_method += 1
-                            else:
-                                wrong_method += 1
-                                conf_wrong[method_names[pred_m]] += 1
-                        else:
-                            missed_real += 1
+    if args.out_csv is None:
+        args.out_csv = os.path.join("reports", f"method_eval_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+    os.makedirs(os.path.dirname(args.out_csv), exist_ok=True)
+    with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["method","N","det_fake_ratio","correct_ratio","wrong_count","missed_count","imgs_per_sec"])
+        for r in rows: w.writerow(r)
 
-                    # progress + memory log
-                    pbar.update(len(paths))
-                    if args.log_mem and (batch_idx % args.log_mem == 0):
-                        vram_mb, ram_mb = _try_mem()
-                        msg = []
-                        if vram_mb is not None: msg.append(f"VRAM={vram_mb:.0f}MB")
-                        if ram_mb is not None:  msg.append(f"RAM={ram_mb:.0f}MB")
-                        if msg: pbar.set_postfix_str(" | ".join(msg))
-
-                    # cleanup batch
-                    del xb, xs, keep_tensors, pbin, pmth
-                    if torch.cuda.is_available() and (batch_idx % 10 == 0):
-                        torch.cuda.empty_cache()
-                    if batch_idx % 20 == 0:
-                        gc.collect()
-
-            finally:
-                pbar.close()
-                if executor is not None:
-                    executor.shutdown(wait=True)
-
-            acc_fake = det_fake / max(1, N)
-            acc_method_overall = correct_method / max(1, N)
-
-            print(f"{method_dir:<18} | N={N:6d} | det_fake={det_fake:6d} ({acc_fake*100:5.1f}%) | "
-                  f"correct={correct_method:6d} ({acc_method_overall*100:5.1f}%) | wrong={wrong_method:6d} | missed={missed_real:6d}")
-
-            if conf_wrong:
-                top = ", ".join([f"{k}:{v}" for k,v in conf_wrong.most_common(5)])
-                print(f"   → nhầm nhiều sang: {top}")
-
-            wr.writerow([method_dir, method_names[m_idx], N, det_fake, correct_method, wrong_method, missed_real,
-                         f"{acc_fake:.6f}", f"{acc_method_overall:.6f}"])
-
-    print(f"\n✔ Đã lưu báo cáo CSV: {csv_path}")
+    if args.out_log is None:
+        args.out_log = args.out_csv.replace(".csv",".log")
+    with open(args.out_log, "w", encoding="utf-8") as f:
+        for ln in log_lines: f.write(ln+"\n")
+        f.write(f"[Done] total_time={total_dt/60:.2f} min\n")
 
 if __name__ == "__main__":
-    pa = argparse.ArgumentParser("Eval từng loại phương pháp deepfake (per-folder)")
-    pa.add_argument("--ckpt", type=str, required=True, help="đường dẫn checkpoint .pt (có meta)")
-    pa.add_argument("--root", type=str, default="data/processed/faces/val/fake", help="thư mục gốc chứa các thư mục phương pháp")
-    pa.add_argument("--tta", type=int, default=2)
-    pa.add_argument("--face_crop", action="store_true", help="crop mặt bằng Mediapipe (chậm)")
-    pa.add_argument("--threshold", type=float, default=None, help="ngưỡng fake (mặc định lấy từ ckpt meta)")
-
-    # tốc độ / bộ nhớ
-    pa.add_argument("--batch", type=int, default=64, help="batch size infer (tăng nếu còn VRAM)")
-    pa.add_argument("--workers", type=int, default=0, help="số luồng đọc/tiền xử lý ảnh (0 = tuần tự). Với --face_crop sẽ bị ép = 0")
-    pa.add_argument("--no_amp", action="store_true", help="tắt autocast fp16 khi có CUDA (mặc định bật)")
-    pa.add_argument("--log_mem", type=int, default=0, help="in VRAM/RAM mỗi N batch (0 = tắt)")
-    args = pa.parse_args()
-    run_eval(args)
+    main()
