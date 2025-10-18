@@ -42,8 +42,13 @@ experiments/
 weights/
 
 # === FRONTEND ===
+# Node / Vite
 node_modules/
+**/node_modules/
+.vite/
+**/.vite/
 dist/
+**/dist/
 build/
 .cache/
 *.local
