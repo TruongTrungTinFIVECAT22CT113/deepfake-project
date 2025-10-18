@@ -1,0 +1,70 @@
+# === ENVIRONMENT & SYSTEM ===
+venv/
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+Thumbs.db
+
+# === PYTORCH / AI MODELS & OUTPUT ===
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.onnx
+*.bin
+*.log
+*.csv
+*.zip
+*.tar
+*.npz
+*.npy
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+data/
+datasets/
+outputs/
+models/
+results/
+checkpoints/
+logs/
+runs/
+experiments/
+weights/
+
+# === FRONTEND ===
+node_modules/
+dist/
+build/
+.cache/
+*.local
+
+# === PYTHON BUILD ===
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# === IDE / EDITOR ===
+.vscode/
+.idea/
+*.swp
+
+# === GIT SAVE SAFE ONLY ===
+!backend/**/*.py
+!deepfake-project/**/*.py
+!frontend/src/**
+!package.json
+!vite.config.ts
+!tsconfig.json
+!requirements*.txt
+!README.md

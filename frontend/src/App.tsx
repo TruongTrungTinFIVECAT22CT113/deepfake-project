@@ -1,0 +1,17 @@
+import React, { useState } from "react";
+import AnalyzerForm from "./components/AnalyzerForm";
+import ResultPanel from "./components/ResultPanel";
+
+export default function App(): JSX.Element {
+  const [loading, setLoading] = useState(false);
+  const [res, setRes] = useState<any>(null);
+
+  return (
+    <div style={{ maxWidth: 900, margin: "40px auto", padding: 16 }}>
+      <h2>Deepfake Detect — React Frontend</h2>
+      <AnalyzerForm onResult={setRes} setLoading={setLoading} />
+      {loading && <p>Đang xử lý…</p>}
+      <ResultPanel result={res} />
+    </div>
+  );
+}
