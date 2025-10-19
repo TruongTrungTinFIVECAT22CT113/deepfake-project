@@ -9,22 +9,26 @@ export default function ModelSelector({
 }) {
   const enabledCount = models.filter(m=>m.enabled).length;
   return (
-    <fieldset style={{border:"1px solid #ccc", padding:12, borderRadius:8}}>
-      <legend>Models</legend>
-      {models.map(m=>{
-        const onlyOneLeft = enabledCount === 1 && m.enabled;
-        return (
-          <label key={m.id} style={{display:"block", marginBottom:6}}>
-            <input
-              type="checkbox"
-              checked={m.enabled}
-              disabled={onlyOneLeft}  // Không cho tắt khi chỉ còn 1 bật
-              onChange={e=>onToggle(m.id, e.target.checked)}
-            />{" "}
-            {m.name} {onlyOneLeft && <em>(required)</em>}
-          </label>
-        );
-      })}
-    </fieldset>
+    <div className="card stack">
+      <div className="section-title">Models</div>
+      <div className="chip-wrap">
+        {models.map(m=>{
+          const onlyOneLeft = enabledCount === 1 && m.enabled;
+          return (
+            <button
+              key={m.id}
+              type="button"
+              className={`chip-toggle ${m.enabled ? 'on' : 'off'}`}
+              aria-pressed={m.enabled}
+              disabled={onlyOneLeft && m.enabled}
+              onClick={()=> onToggle(m.id, !m.enabled)}
+            >{m.name}</button>
+          );
+        })}
+      </div>
+      {enabledCount === 1 && (
+        <div className="help">At least one model must remain enabled.</div>
+      )}
+    </div>
   );
 }
