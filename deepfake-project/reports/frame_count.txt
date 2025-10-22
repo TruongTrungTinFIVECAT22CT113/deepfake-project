@@ -1,0 +1,46 @@
+PS H:\deepfake-project\deepfake-project\shared> & H:/venvs/deepfake/Scripts/Activate.ps1
+(deepfake) PS H:\deepfake-project\deepfake-project\shared> python count_frames.py --data_root H:\deepfake-project\deepfake-project\data\processed_multi
+📊 Frame counts per branch/split (processed_multi):
+
+[TRAIN] total: 545,820
+  face  | real: 83,940 | fake_total: 210,000 | sum: 293,940
+     └─ Deepfakes       : 42,000
+     └─ Face2Face       : 42,000
+     └─ FaceShifter     : 42,000
+     └─ FaceSwap        : 42,000
+     └─ NeuralTextures  : 42,000
+  head  | real: 83,940 | fake_total: 42,000 | sum: 125,940
+     └─ Audio2Animation : 42,000
+  full  | real: 83,940 | fake_total: 42,000 | sum: 125,940
+     └─ Video2VideoID   : 42,000
+
+[VAL] total: 156,000
+  face  | real: 24,000 | fake_total: 60,000 | sum: 84,000
+     └─ Deepfakes       : 12,000
+     └─ Face2Face       : 12,000
+     └─ FaceShifter     : 12,000
+     └─ FaceSwap        : 12,000
+     └─ NeuralTextures  : 12,000
+  head  | real: 24,000 | fake_total: 12,000 | sum: 36,000
+     └─ Audio2Animation : 12,000
+  full  | real: 24,000 | fake_total: 12,000 | sum: 36,000
+     └─ Video2VideoID   : 12,000
+
+[TEST] total: 78,000
+     └─ Deepfakes       : 6,000
+     └─ Face2Face       : 6,000
+     └─ FaceShifter     : 6,000
+     └─ FaceSwap        : 6,000
+     └─ NeuralTextures  : 6,000
+  head  | real: 12,000 | fake_total: 6,000 | sum: 18,000
+     └─ Audio2Animation : 6,000
+  full  | real: 12,000 | fake_total: 6,000 | sum: 18,000
+     └─ Video2VideoID   : 6,000
+
+📦 Tổng theo branch (gộp train/val/test):
+  - face : 419,940
+  - head : 179,940
+  - full : 179,940
+
+✅ Báo cáo CSV đã lưu: H:\deepfake-project\deepfake-project\data\reports\frame_summary.csv
+(deepfake) PS H:\deepfake-project\deepfake-project\shared>

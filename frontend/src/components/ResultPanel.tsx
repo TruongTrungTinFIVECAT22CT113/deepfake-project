@@ -1,56 +1,89 @@
-import React, { useMemo, useRef, useState, useEffect } from "react";
+import React, { useRef, useState, useEffect } from "react";
 
+// Fallback parsing cho backend cũ
 function extractFramesLine(html: string): string | null {
   const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
   const m = text.match(/Frames:\s*\d+\s*\|\s*Fake-frames:\s*\d+\s*\(\d+(?:\.\d+)?%\)/i);
   return m ? m[0] : null;
 }
 
+type NewFields = {
+  frames_total?: number;
+  fake_frames?: number;
+  fake_ratio?: number;    // 0..1
+  threshold_used?: number;
+};
+
 export default function ResultPanel(props: {
   result?: {
     verdict: string;
-    fake_real_bar_html: string;
-    method_rows: [string, number][];
     video_url: string;
-  }
+    method_rows: [string, number][];
+    fake_real_bar_html?: string;
+  } & NewFields;
+  loading?: boolean;
 }): JSX.Element | null {
   const r = props.result;
-  const framesLine = useMemo(() => (r ? extractFramesLine(r.fake_real_bar_html) : null), [r]);
 
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [rate, setRate] = useState(1.0); // NEW: playback rate
+  const [rate, setRate] = useState(1.0);
+  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = rate; }, [rate]);
 
-  useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = rate;
-  }, [rate]);
+  if (props.loading) {
+    return (
+      <div className="stack">
+        <div className="skeleton box" />
+        <div className="skeleton line" />
+        <div className="skeleton line" />
+      </div>
+    );
+  }
+  if (!r) return <div className="muted">No result yet. Upload a video and analyze.</div>;
 
-  if (!r) return null;
+  // Ưu tiên số liệu mới; thiếu thì fallback qua HTML
+  const framesLine =
+    r.frames_total && r.fake_frames && r.fake_ratio !== undefined
+      ? `Frames: ${r.frames_total} | Fake-frames: ${r.fake_frames} (${(r.fake_ratio * 100).toFixed(1)}%)`
+      : (r.fake_real_bar_html ? extractFramesLine(r.fake_real_bar_html) : null);
 
   return (
-    <div style={{ display: "grid", gap: 12 }}>
-      <video ref={videoRef} src={r.video_url} controls style={{ maxWidth: "100%", borderRadius: 12 }} />
+    <div className="stack">
+      <video ref={videoRef} src={r.video_url} className="media" controls />
 
-      {/* NEW: slider tốc độ phát */}
-      <label>
-        Playback speed: <b>{rate.toFixed(2)}×</b>
+      <div>
+        <div className="muted" style={{marginBottom:6}}>Playback speed: <b>{rate.toFixed(2)}x</b></div>
         <input type="range" min="0.25" max="2" step="0.05"
                value={rate} onChange={(e)=>setRate(parseFloat(e.target.value))}/>
-      </label>
+      </div>
 
-      {/* Chỉ hiển thị thống kê Frames; ẩn thanh Fake/Real */}
       {framesLine && <div style={{ fontWeight: 600 }}>{framesLine}</div>}
+      {typeof r.threshold_used === "number" && (
+        <div className="muted">Threshold used: <b>{r.threshold_used.toFixed(3)}</b></div>
+      )}
 
-      <div><b>{r.verdict}</b></div>
+      <div className="actions">
+        <a className="btn small" href={r.video_url} download>Download result</a>
+        <button className="btn small btn-ghost" onClick={() => navigator.clipboard?.writeText(window.location.origin + r.video_url)}>
+          Copy link
+        </button>
+      </div>
 
       {r.method_rows?.length > 0 && (
-        <table>
-          <thead><tr><th>Method</th><th>%</th></tr></thead>
-          <tbody>
-            {r.method_rows.map(([m, p], i) => (
-              <tr key={i}><td>{m}</td><td>{p}</td></tr>
-            ))}
-          </tbody>
-        </table>
+        <div className="stack">
+          <div className="section-title">Method distribution (fake frames)</div>
+          <table className="pretty">
+            <thead><tr><th>Method</th><th style={{width:120}}>Percent</th><th></th></tr></thead>
+            <tbody>
+              {r.method_rows.map(([m, p], i) => (
+                <tr key={i}>
+                  <td>{m}</td>
+                  <td>{typeof p === 'number' ? p.toFixed(1) : p}%</td>
+                  <td><div className="bar"><span style={{width: `${Math.max(0, Math.min(100, Number(p))) }%`}} /></div></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   );

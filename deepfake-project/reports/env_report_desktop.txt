@@ -1,6 +1,7 @@
 Python      : 3.11.0
 PyTorch     : 2.5.1+cu121 | CUDA=True | device_count=1
 CUDA device : NVIDIA GeForce RTX 4070 Ti SUPER
+cuDNN       : enabled=True | version=90100
 
 Packages:
 - torch           2.5.1+cu121
@@ -13,7 +14,7 @@ Packages:
 - tqdm            4.67.1
 - numpy           2.2.6
 - pillow          11.0.0
-- pandas          2.3.3
+- pandas          2.3.2
 - scikit-image    NOT INSTALLED
 - scikit-learn    NOT INSTALLED
 - onnxruntime     NOT INSTALLED

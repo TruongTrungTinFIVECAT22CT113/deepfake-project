@@ -1,12 +1,5 @@
 # deepfake_detector/src/train_vit.py
-import os
-import re
-import time
-import json
-import math
-import random
-import signal
-import argparse
+import os, re, time, json, math, random, signal, argparse, csv
 from typing import List, Tuple, Dict
 
 import torch
@@ -23,526 +16,496 @@ from torchvision import transforms
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
-def natural_key(path: str):
-    return [int(s) if s.isdigit() else s.lower() for s in re.split(r'(\d+)', path)]
+BRANCH2ID = {"face": 0, "head": 1, "full": 2}
+ID2BRANCH = {v:k for k,v in BRANCH2ID.items()}
 
-def list_images(root: str, exts=(".jpg", ".jpeg", ".png", ".bmp", ".webp")):
-    out = []
+# -------------- utils --------------
+def natural_key(s: str):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+def list_images(root: str, exts=(".jpg",".jpeg",".png",".bmp",".webp")):
+    files=[]
     for e in exts:
-        out.extend(glob(os.path.join(root, f"**/*{e}"), recursive=True))
-    out.sort(key=natural_key)
-    return out
+        files += glob(os.path.join(root, f"**/*{e}"), recursive=True)
+    files.sort(key=natural_key)
+    return files
 
 def parse_method_boost(s: str) -> Dict[str, float]:
-    out = {}
-    if not s:
-        return out
-    parts = [p.strip() for p in s.split(",") if p.strip()]
-    for p in parts:
+    out={}
+    if not s: return out
+    for p in s.split(","):
+        p=p.strip()
+        if not p: continue
         if "=" in p:
-            k, v = p.split("=", 1)
-            try:
-                out[k.strip()] = float(v.strip())
-            except:
-                pass
+            k,v=p.split("=",1)
+            try: out[k.strip()]=float(v.strip())
+            except: pass
     return out
 
-class FacesDataset(Dataset):
-    def __init__(self, data_root: str, split: str, methods: List[str],
-                 tfm, face_crop: bool = False):
+# -------------- dataset (auto-discovery) --------------
+class MultiBranchDataset(Dataset):
+    """
+    Cấu trúc:
+      data_root/
+        face|head|full / train|val|test / <submethod> / <video-id> / 000000.jpg ...
+    - Real_*: 'real_face' / 'real_head' / 'real_full'
+    - Fake : các tên còn lại
+    """
+    def __init__(self, data_root: str, split: str, tfm):
         self.data_root = data_root
         self.split = split
-        self.methods = methods
         self.tfm = tfm
-        self.face_crop = face_crop
 
-        self.samples: List[Tuple[str, int, int]] = []
-        for mi, m in enumerate(methods):
-            root_m = os.path.join(data_root, split, "fake", m)
-            imgs = list_images(root_m)
-            self.samples.extend([(p, 0, mi) for p in imgs])  # 0=fake
-        root_r = os.path.join(data_root, split, "real")
-        imgs = list_images(root_r)
-        self.samples.extend([(p, 1, -1) for p in imgs])     # 1=real
+        self.samples: List[Tuple[str,int,int,int,int]] = []  # (path, y_bin, y_met, y_branch, y_branch_cls)
+        self.branch_methods = { 'face': set(), 'head': set(), 'full': set() }
+
+        tmp: List[Tuple[str,int,str,int]] = []  # (path, yb, ym_name|-1, y_branch)
+        for br in ["face","head","full"]:
+            split_dir = os.path.join(data_root, br, split)
+            if not os.path.isdir(split_dir):
+                continue
+
+            # 1) REAL: real_face / real_head / real_full
+            real_dir = os.path.join(split_dir, f"real_{br}")
+            if os.path.isdir(real_dir):
+                for img in list_images(real_dir):
+                    tmp.append((img, 1, -1, BRANCH2ID[br]))
+
+            # 2) FAKE: fake_face/*method*/..., fake_head/*method*/..., fake_full/*method*/...
+            fake_root = os.path.join(split_dir, f"fake_{br}")
+            if os.path.isdir(fake_root):
+                for method_name in sorted([d for d in os.listdir(fake_root)
+                                           if os.path.isdir(os.path.join(fake_root, d))]):
+                    self.branch_methods[br].add(method_name)
+                    method_dir = os.path.join(fake_root, method_name)
+                    for img in list_images(method_dir):
+                        tmp.append((img, 0, method_name, BRANCH2ID[br]))
+
+        # union fake methods cho head_met
+        self.method_names = sorted({m for s in self.branch_methods.values() for m in s})
+        self.method_to_idx = {m:i for i,m in enumerate(self.method_names)}
+
+        # lớp theo từng branch: real_* + fake của branch đó
+        self.branch_classnames = {
+            'face': ["real_face"] + sorted(self.branch_methods['face']),
+            'head': ["real_head"] + sorted(self.branch_methods['head']),
+            'full': ["real_full"] + sorted(self.branch_methods['full']),
+        }
+        self.branch_class_to_idx = {
+            br: {n:i for i,n in enumerate(names)}
+            for br, names in self.branch_classnames.items()
+        }
+
+        # build samples cuối
+        for p, yb, ym_name, ybr in tmp:
+            br = ID2BRANCH[ybr]
+            if yb == 1:
+                ybcls = self.branch_class_to_idx[br][f"real_{br}"]
+                self.samples.append((p, 1, -1, ybr, ybcls))
+            else:
+                ym = self.method_to_idx[str(ym_name)]
+                ybcls = self.branch_class_to_idx[br][str(ym_name)]
+                self.samples.append((p, 0, ym, ybr, ybcls))
 
         self.samples.sort(key=lambda t: natural_key(t[0]))
 
-        self.per_class = {"real": 0}
-        for m in methods:
-            self.per_class[m] = 0
-        for _, yb, ym in self.samples:
-            if yb == 1:
-                self.per_class["real"] += 1
-            else:
-                self.per_class[methods[ym]] += 1
+        # thống kê
+        self.per_class = {f"real_{br}":0 for br in ["face","head","full"]}
+        for m in self.method_names: self.per_class[m]=0
+        for _, yb, ym, ybr, _ in self.samples:
+            if yb==1: self.per_class[f"real_{ID2BRANCH[ybr]}"] += 1
+            else:     self.per_class[self.method_names[ym]] += 1
 
-    def __len__(self):
-        return len(self.samples)
+    def __len__(self): return len(self.samples)
 
     def __getitem__(self, idx):
-        path, yb, ym = self.samples[idx]
+        path, yb, ym, ybr, ybcls = self.samples[idx]
         with Image.open(path) as im:
             im = im.convert("RGB")
             x = self.tfm(im)
-        return x, torch.tensor(yb, dtype=torch.long), torch.tensor(ym, dtype=torch.long)
+        return (
+            x,
+            torch.tensor(yb, dtype=torch.long),
+            torch.tensor(ym, dtype=torch.long),
+            torch.tensor(ybr, dtype=torch.long),
+            torch.tensor(ybcls, dtype=torch.long),
+        )
 
+# -------------- model --------------
 class MultiHeadViT(nn.Module):
     def __init__(self, model_name: str, img_size: int, num_methods: int,
-                 drop_rate: float = 0.0, drop_path_rate: float = 0.0):
+                 num_face_classes: int, num_head_classes: int, num_full_classes: int,
+                 drop_rate: float=0.0, drop_path_rate: float=0.0):
         super().__init__()
         self.backbone = timm.create_model(
-            model_name,
-            pretrained=True,
-            num_classes=0,
-            img_size=img_size,
-            drop_rate=drop_rate,
-            drop_path_rate=drop_path_rate
+            model_name, pretrained=True, num_classes=0, img_size=img_size,
+            drop_rate=drop_rate, drop_path_rate=drop_path_rate
         )
-        feat_dim = self.backbone.num_features
-        self.head_bin = nn.Sequential(
-            nn.Dropout(p=drop_rate if drop_rate>0 else 0.0),
-            nn.Linear(feat_dim, 2)
-        )           # 0=fake, 1=real
-        self.head_met = nn.Sequential(
-            nn.Dropout(p=drop_rate if drop_rate>0 else 0.0),
-            nn.Linear(feat_dim, num_methods)
-        )           # method (fake)
+        feat = self.backbone.num_features
+        def head(n):
+            return nn.Sequential(nn.Dropout(p=drop_rate if drop_rate>0 else 0.0),
+                                 nn.Linear(feat, n))
+        self.head_bin  = head(2)
+        self.head_met  = head(num_methods)
+        self.head_face = head(num_face_classes)
+        self.head_head = head(num_head_classes)
+        self.head_full = head(num_full_classes)
 
     def forward(self, x):
         f = self.backbone(x)
-        lb = self.head_bin(f)
-        lm = self.head_met(f)
-        return lb, lm
+        return ( self.head_bin(f),
+                 self.head_met(f),
+                 self.head_face(f),
+                 self.head_head(f),
+                 self.head_full(f) )
 
+# -------------- EMA --------------
 class EMA:
     def __init__(self, model: nn.Module, decay=0.9999):
         self.decay = decay
-        self.shadow = {}
-        for n, p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[n] = p.data.clone()
-
+        self.shadow = {n:p.data.clone() for n,p in model.named_parameters() if p.requires_grad}
     @torch.no_grad()
     def update(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            self.shadow[n] = (1.0 - self.decay) * p.data + self.decay * self.shadow[n]
-
+        for n,p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[n] = (1.0-self.decay)*p.data + self.decay*self.shadow[n]
     @torch.no_grad()
     def apply_to(self, model: nn.Module):
-        for n, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            p.data.copy_(self.shadow[n])
+        for n,p in model.named_parameters():
+            if p.requires_grad:
+                p.data.copy_(self.shadow[n])
 
-def focal_ce(logits: torch.Tensor, targets: torch.Tensor, weight=None, gamma: float = 0.0, label_smoothing: float = 0.0):
-    if gamma <= 0.0:
+# -------------- loss helpers --------------
+def focal_ce(logits, targets, weight=None, gamma=0.0, label_smoothing=0.0):
+    if gamma<=0.0:
         return F.cross_entropy(logits, targets, weight=weight, label_smoothing=label_smoothing)
     logp = F.log_softmax(logits, dim=1)
     p = logp.exp()
-    tgt_logp = logp.gather(1, targets.view(-1, 1)).squeeze(1)
-    pt = p.gather(1, targets.view(-1, 1)).squeeze(1).clamp_min(1e-8)
-    focal = ((1 - pt) ** gamma) * (-tgt_logp)
+    tgt_logp = logp.gather(1, targets.view(-1,1)).squeeze(1)
+    pt = p.gather(1, targets.view(-1,1)).squeeze(1).clamp_min(1e-8)
+    focal = ((1-pt)**gamma) * (-tgt_logp)
     if weight is not None:
         w = weight.gather(0, targets)
         focal = focal * w
-    if label_smoothing > 0.0:
-        focal = (1 - label_smoothing) * focal + label_smoothing * (-logp.mean(dim=1))
+    if label_smoothing>0.0:
+        focal = (1-label_smoothing)*focal + label_smoothing*(-logp.mean(dim=1))
     return focal.mean()
 
-def soft_ce(logits: torch.Tensor, soft_targets: torch.Tensor):
-    logp = F.log_softmax(logits, dim=1)
-    loss = -(soft_targets * logp).sum(dim=1).mean()
-    return loss
+def one_hot(y, n): return F.one_hot(y, num_classes=n).float()
 
-def rand_bbox(W, H, lam):
-    r = math.sqrt(1 - lam)
-    cut_w = int(W * r); cut_h = int(H * r)
-    cx = random.randint(0, W - 1); cy = random.randint(0, H - 1)
-    x1 = max(cx - cut_w // 2, 0); y1 = max(cy - cut_h // 2, 0)
-    x2 = min(x1 + cut_w, W); y2 = min(y1 + cut_h, H)
-    return x1, y1, x2, y2
-
-def one_hot(labels: torch.Tensor, num_classes: int):
-    return F.one_hot(labels, num_classes=num_classes).float()
-
-def apply_mix(x, yb, mixup_alpha: float, cutmix_alpha: float, mix_prob: float):
-    if mix_prob <= 0 or (mixup_alpha <= 0 and cutmix_alpha <= 0):
-        return x, one_hot(yb, 2), False
-    do = random.random() < mix_prob
-    if not do:
-        return x, one_hot(yb, 2), False
-    B, C, H, W = x.size()
+def apply_mix(x, y, mixup_alpha, cutmix_alpha, prob):
+    if prob<=0 or (mixup_alpha<=0 and cutmix_alpha<=0): return x, one_hot(y,2), False
+    if random.random()>=prob: return x, one_hot(y,2), False
+    B,C,H,W = x.shape
     idx = torch.randperm(B, device=x.device)
-    yb2 = yb[idx]
-    if cutmix_alpha > 0 and random.random() < 0.5:
-        lam = random.betavariate(cutmix_alpha, cutmix_alpha)
-        lam = max(0.0, min(1.0, lam))
-        x1, y1, x2, y2 = rand_bbox(W, H, lam)
-        x_m = x.clone()
-        x_m[:, :, y1:y2, x1:x2] = x[idx, :, y1:y2, x1:x2]
-        area = abs((x2 - x1) * (y2 - y1))
-        lam_adj = 1.0 - float(area) / float(W * H)
-        t1 = one_hot(yb, 2); t2 = one_hot(yb2, 2)
-        soft_t = lam_adj * t1 + (1 - lam_adj) * t2
-        return x_m, soft_t, True
+    if cutmix_alpha>0 and random.random()<0.5:
+        lam = random.betavariate(cutmix_alpha, cutmix_alpha); lam=max(0,min(1,lam))
+        r = math.sqrt(1-lam)
+        cw, ch = int(W*r), int(H*r)
+        cx, cy = random.randint(0,W-1), random.randint(0,H-1)
+        x1, y1 = max(0,cx-cw//2), max(0,cy-ch//2)
+        x2, y2 = min(W, x1+cw), min(H, y1+ch)
+        xmix = x.clone()
+        xmix[:,:,y1:y2,x1:x2] = x[idx,:,y1:y2,x1:x2]
+        lam2 = 1 - ( (x2-x1)*(y2-y1) / float(W*H) )
+        t = lam2*one_hot(y,2)+(1-lam2)*one_hot(y[idx],2)
+        return xmix, t, True
     else:
-        lam = random.betavariate(mixup_alpha, mixup_alpha)
-        lam = max(0.0, min(1.0, lam))
-        x_m = lam * x + (1 - lam) * x[idx]
-        t1 = one_hot(yb, 2); t2 = one_hot(yb2, 2)
-        soft_t = lam * t1 + (1 - lam) * t2
-        return x_m, soft_t, True
+        lam = random.betavariate(mixup_alpha, mixup_alpha); lam=max(0,min(1,lam))
+        xmix = lam*x + (1-lam)*x[idx]
+        t = lam*one_hot(y,2) + (1-lam)*one_hot(y[idx],2)
+        return xmix, t, True
 
+# -------------- eval --------------
 @torch.no_grad()
-def evaluate(model, loader, device, methods: List[str],
-             thr_min: float, thr_max: float,
-             method_loss_weight: float = 0.2,
-             label_smoothing: float = 0.0,
-             use_ema: bool = False,
-             ema_obj: EMA = None,
-             val_tta: str = "none",
-             thr_steps: int = 101,
-             cons_bacc_min: float = 0.90,
-             cons_rec_real_min: float = 0.90):
-    """
-    VAL/TEST streaming: tính loss/acc/bacc theo ngưỡng ngay trong lúc duyệt batch.
-    """
-    # Backup EMA -> CPU để không phình VRAM
-    backup = None
-    if use_ema and (ema_obj is not None) and len(ema_obj.shadow) > 0:
-        backup = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+def evaluate(model, loader, device, method_names: List[str],
+             thr_min, thr_max, thr_steps,
+             method_loss_weight=0.2, label_smoothing=0.0,
+             use_ema=False, ema_obj=None, val_tta="none",
+             cons_bacc_min=0.90, cons_rec_real_min=0.90,
+             phase_name="VAL"):  # <— thêm
+    backup=None
+    if use_ema and ema_obj is not None and len(ema_obj.shadow)>0:
+        backup={k:v.detach().cpu() for k,v in model.state_dict().items()}
         ema_obj.apply_to(model)
 
     model.eval()
-    t0 = time.time()
+    t0=time.time()
 
-    thrs = torch.linspace(thr_min, thr_max, steps=thr_steps, device=device)  # [K]
-    correct_fake = torch.zeros_like(thrs, dtype=torch.float64)
-    correct_real = torch.zeros_like(thrs, dtype=torch.float64)
-    total_fake = 0
-    total_real = 0
+    K=thr_steps
+    thrs=torch.linspace(thr_min,thr_max,steps=K,device=device)
+    correct_fake=torch.zeros(K,dtype=torch.float64,device=device)
+    correct_real=torch.zeros(K,dtype=torch.float64,device=device)
+    tot_fake=0; tot_real=0
 
-    sum_loss_bin = 0.0
-    n_loss = 0
+    br_corr={0:torch.zeros(K,dtype=torch.float64,device=device),
+             1:torch.zeros(K,dtype=torch.float64,device=device),
+             2:torch.zeros(K,dtype=torch.float64,device=device)}
+    br_tot={0:0,1:0,2:0}
 
-    method_correct = 0
-    method_total = 0
+    method_correct=0; method_total=0
+    per_m_correct={m:0 for m in method_names}
+    per_m_total  ={m:0 for m in method_names}
+    
+    for x,yb,ym,ybr,_ in tqdm(loader, desc=f'[{phase_name}]', dynamic_ncols=True):  # <— dùng nhãn
+        x=x.to(device); yb=yb.to(device); ym=ym.to(device); ybr=ybr.to(device)
 
-    pbar = tqdm(loader, desc='[VAL]', dynamic_ncols=True)
-    for x, yb, ym in pbar:
-        x = x.to(device, non_blocking=True)
-        yb = yb.to(device, non_blocking=True)
-        ym = ym.to(device, non_blocking=True)
+        if val_tta=="hflip":
+            x2=torch.flip(x,[-1])
+            lb1,lm1,_,_,_=model(x); lb2,lm2,_,_,_=model(x2)
+            lb=(lb1+lb2)*0.5; lm=(lm1+lm2)*0.5
+        else:
+            lb,lm,_,_,_=model(x)
 
-        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-            if val_tta == "hflip":
-                x_flip = torch.flip(x, dims=[-1])
-                lb1, lm1 = model(x)
-                lb2, lm2 = model(x_flip)
-                lb = (lb1 + lb2) * 0.5
-                lm = (lm1 + lm2) * 0.5
-            else:
-                lb, lm = model(x)
+        mask_fake=(yb==0) & (ym>=0)
+        if mask_fake.any():
+            pred_m=lm[mask_fake].argmax(1)
+            mt=ym[mask_fake]
+            method_correct += int((pred_m==mt).sum().item())
+            method_total   += int(mask_fake.sum().item())
+            for i in range(mt.numel()):
+                t=int(mt[i]); p=int(pred_m[i])
+                per_m_total[method_names[t]] += 1
+                if p==t: per_m_correct[method_names[t]] += 1
 
-            loss_bin = F.cross_entropy(lb, yb, label_smoothing=label_smoothing, reduction='mean')
-        B = yb.size(0)
-        sum_loss_bin += float(loss_bin.item()) * B
-        n_loss += B
+        p_fake=torch.softmax(lb.float(),dim=1)[:,0]
+        comp=(p_fake.unsqueeze(1) >= thrs.unsqueeze(0))
+        pred_bin=torch.where(comp, torch.zeros_like(yb).unsqueeze(1),
+                             torch.ones_like(yb).unsqueeze(1))
+        yexp=yb.unsqueeze(1).expand_as(pred_bin)
+        is_fake=(yexp==0); is_real=(yexp==1)
+        correct_fake += (pred_bin==0).logical_and(is_fake).sum(0).to(torch.float64)
+        correct_real += (pred_bin==1).logical_and(is_real).sum(0).to(torch.float64)
+        tot_fake += int((yb==0).sum().item()); tot_real += int((yb==1).sum().item())
 
-        fake_mask = (yb == 0) & (ym >= 0)
-        if fake_mask.any():
-            pred_m = lm[fake_mask].argmax(1)
-            method_correct += int((pred_m == ym[fake_mask]).sum().item())
-            method_total += int(fake_mask.sum().item())
+        for bid in (0,1,2):
+            mask=(ybr==bid)
+            if mask.any():
+                br_tot[bid]+=int(mask.sum().item())
+                pb=p_fake[mask]
+                compb=(pb.unsqueeze(1)>=thrs.unsqueeze(0))
+                predb=torch.where(compb, torch.zeros_like(yb[mask]).unsqueeze(1),
+                                  torch.ones_like(yb[mask]).unsqueeze(1))
+                br_corr[bid]+= (predb==yb[mask].unsqueeze(1)).sum(0).to(torch.float64)
 
-        probs_fake = torch.softmax(lb.float(), dim=1)[:, 0]
-        comp = (probs_fake.unsqueeze(1) >= thrs.unsqueeze(0))
-        pred_bin = torch.where(comp, torch.zeros_like(yb).unsqueeze(1), torch.ones_like(yb).unsqueeze(1))  # [B,K]
-        yb_expand = yb.unsqueeze(1).expand_as(pred_bin)
+    rec_fake=(correct_fake/max(1,tot_fake)).cpu()
+    rec_real=(correct_real/max(1,tot_real)).cpu()
+    bacc=0.5*(rec_fake+rec_real)
+    acc =(correct_fake+correct_real).cpu()/float(tot_fake+tot_real+1e-12)
+    best_idx=int(torch.argmax(bacc))
+    res={
+        "acc": float(acc[best_idx]),
+        "bacc": float(bacc[best_idx]),
+        "best_thr": float(thrs[best_idx].cpu()),
+        "rec_fake": float(rec_fake[best_idx]),
+        "rec_real": float(rec_real[best_idx]),
+        "method_acc_fake": (method_correct/method_total if method_total>0 else 0.0),
+        "acc_face_bin": (float((br_corr[0][best_idx]/br_tot[0]).cpu()) if br_tot[0]>0 else None),
+        "acc_head_bin": (float((br_corr[1][best_idx]/br_tot[1]).cpu()) if br_tot[1]>0 else None),
+        "acc_full_bin": (float((br_corr[2][best_idx]/br_tot[2]).cpu()) if br_tot[2]>0 else None),
+        "per_method_acc": {m:(per_m_correct[m]/per_m_total[m] if per_m_total[m]>0 else None) for m in method_names}
+    }
 
-        is_fake = (yb_expand == 0)
-        correct_fake += (pred_bin == 0).logical_and(is_fake).sum(dim=0).to(torch.float64)
-        total_fake += int((yb == 0).sum().item())
-
-        is_real = (yb_expand == 1)
-        correct_real += (pred_bin == 1).logical_and(is_real).sum(dim=0).to(torch.float64)
-        total_real += int((yb == 1).sum().item())
+    # constraint optional
+    mask = (bacc>=cons_bacc_min) & (rec_real>=cons_rec_real_min)
+    if mask.any():
+        idxs=torch.nonzero(mask).squeeze(1)
+        # chọn max recall fake
+        best=idxs[torch.argmax(rec_fake[idxs])]
+        res.update({
+            "cons_thr": float(thrs[best].cpu()),
+            "cons_acc": float(acc[best]),
+            "cons_bacc": float(bacc[best]),
+            "cons_rec_fake": float(rec_fake[best]),
+            "cons_rec_real": float(rec_real[best]),
+        })
 
     if backup is not None:
         model.load_state_dict(backup, strict=False)
 
-    eps = 1e-12
-    rec_fake = (correct_fake / max(total_fake, 1)).clamp_(0, 1)
-    rec_real = (correct_real / max(total_real, 1)).clamp_(0, 1)
-    bacc_all = 0.5 * (rec_fake + rec_real)
-    acc_all = (correct_fake + correct_real) / float(total_fake + total_real + eps)
+    print(f"[KQ {phase_name}] acc={res['acc']:.4f} | bacc={res['bacc']:.4f} | "
+          f"rec_fake={res['rec_fake']:.4f} | rec_real={res['rec_real']:.4f} | "
+          f"thr*={res['best_thr']:.3f} | m_acc(fake)={res['method_acc_fake']:.4f}")
+    return res
 
-    best_idx = int(torch.argmax(bacc_all).item())
-    best_bacc = float(bacc_all[best_idx].item())
-    best_acc  = float(acc_all[best_idx].item())
-    best_thr  = float(thrs[best_idx].item())
-    best_rec_fake = float(rec_fake[best_idx].item())
-    best_rec_real = float(rec_real[best_idx].item())
-
-    # Constraint selection
-    cons_idx = None
-    cons_thr = None
-    cons_vals = None
-    mask = (bacc_all >= cons_bacc_min) & (rec_real >= cons_rec_real_min)
-    if mask.any():
-        idxs = torch.nonzero(mask).squeeze(1)
-        score = rec_fake[idxs] + 1e-6 * acc_all[idxs]
-        cand = idxs[torch.argmax(score)]
-        cons_idx = int(cand.item())
-        cons_thr = float(thrs[cons_idx].item())
-        cons_vals = (
-            float(acc_all[cons_idx].item()),
-            float(bacc_all[cons_idx].item()),
-            float(rec_fake[cons_idx].item()),
-            float(rec_real[cons_idx].item()),
-        )
-        print(f"[KQ VAL CONSTRAINT] acc={cons_vals[0]:.4f} | bacc={cons_vals[1]:.4f} | rec_fake={cons_vals[2]:.4f} | rec_real={cons_vals[3]:.4f} | thr@cons={cons_thr:.3f}")
-    else:
-        print("[KQ VAL CONSTRAINT] Không có ngưỡng thỏa điều kiện.")
-
-    val_loss = sum_loss_bin / max(n_loss, 1)
-    method_acc = (method_correct / method_total) if method_total > 0 else 0.0
-    elapsed = time.time() - t0
-
-    print(
-        f"[KQ VAL] loss={val_loss:.4f} | loss_bin={val_loss:.4f} | "
-        f"loss_met={0.0:.4f} (x{method_loss_weight:.2f}) | "
-        f"acc={best_acc:.4f} | bacc={best_bacc:.4f} | "
-        f"rec_fake={best_rec_fake:.4f} | rec_real={best_rec_real:.4f} | "
-        f"ngưỡng tốt={best_thr:.3f} | acc phương pháp (fake)={method_acc:.4f} | "
-        f"thời gian val={elapsed/60:.2f} phút"
-    )
-    return {
-        'loss': val_loss,
-        'acc': best_acc,
-        'bacc': best_bacc,
-        'best_thr': best_thr,
-        'rec_fake': best_rec_fake,
-        'rec_real': best_rec_real,
-        'method_acc_fake': float(method_acc),
-        'cons_thr': cons_thr,
-        'cons_acc': (cons_vals[0] if cons_vals else None),
-        'cons_bacc': (cons_vals[1] if cons_vals else None),
-        'cons_rec_fake': (cons_vals[2] if cons_vals else None),
-        'cons_rec_real': (cons_vals[3] if cons_vals else None),
-    }
-
+# -------------- main --------------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, required=True)
-    parser.add_argument("--epochs", type=int, default=8)
-    parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--micro_batch", type=int, default=32)
-    parser.add_argument("--val_batch", type=int, default=64)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--img_size", type=int, default=512)
-    parser.add_argument("--model", type=str, default="vit_base_patch16_384") # "vit_base_patch16_224", "vit_base_patch16_384", "vit_large_patch16_224", "vit_large_patch16_384", ...
-    parser.add_argument("--ema", action="store_true")
-    parser.add_argument("--face_crop", action="store_true")
+    ap=argparse.ArgumentParser()
+    ap.add_argument("--data_root", required=True)
+    ap.add_argument("--out_dir", required=True)
 
-    parser.add_argument("--balance_by_method", action="store_true")
-    parser.add_argument("--method_boost", type=str, default="")
-    parser.add_argument("--bin_balance_sampler", action="store_true")
+    ap.add_argument("--epochs", type=int, default=8)
+    ap.add_argument("--batch_size", type=int, default=64)
+    ap.add_argument("--micro_batch", type=int, default=16)
+    ap.add_argument("--val_batch", type=int, default=64)
+    ap.add_argument("--workers", type=int, default=4)
 
-    parser.add_argument("--method_loss_weight", type=float, default=0.2)
-    parser.add_argument("--bin_weight_real", type=float, default=1.0)
-    parser.add_argument("--focal_gamma", type=float, default=0.0)
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    ap.add_argument("--img_size", type=int, default=512)
+    ap.add_argument("--model", default="vit_base_patch16_384")
 
-    parser.add_argument("--mixup", type=float, default=0.0)
-    parser.add_argument("--cutmix", type=float, default=0.0)
-    parser.add_argument("--mixup_prob", type=float, default=0.0)
-    parser.add_argument("--color_jitter", type=float, default=0.3)
-    parser.add_argument("--rand_erase_p", type=float, default=0.25)
-    parser.add_argument("--random_resized_crop", action="store_true")
+    ap.add_argument("--ema", action="store_true")
+    ap.add_argument("--val_use_ema", action="store_true")
 
-    parser.add_argument("--drop_rate", type=float, default=0.1)
-    parser.add_argument("--drop_path_rate", type=float, default=0.1)
+    # cân bằng
+    ap.add_argument("--balance_by_method", action="store_true")
+    ap.add_argument("--method_boost", type=str, default="")
+    ap.add_argument("--bin_balance_sampler", action="store_true")
 
-    parser.add_argument("--lr", type=float, default=8e-6)
-    parser.add_argument("--warmup_steps", type=int, default=800)
-    parser.add_argument("--clip_grad", type=float, default=1.0)
-    parser.add_argument("--weight_decay", type=float, default=0.05)
+    # loss weights
+    ap.add_argument("--method_loss_weight", type=float, default=0.2)
+    ap.add_argument("--face_head_loss_weight", type=float, default=0.25)
+    ap.add_argument("--head_head_loss_weight", type=float, default=0.25)
+    ap.add_argument("--full_head_loss_weight", type=float, default=0.25)
 
-    parser.add_argument("--thr_min", type=float, default=0.55)
-    parser.add_argument("--thr_max", type=float, default=0.90)
-    parser.add_argument("--thr_steps", type=int, default=101)
+    ap.add_argument("--bin_weight_real", type=float, default=1.0)
+    ap.add_argument("--focal_gamma", type=float, default=0.0)
+    ap.add_argument("--label_smoothing", type=float, default=0.0)
 
-    parser.add_argument("--resume", type=str, default="")
-    parser.add_argument("--freeze_epochs", type=int, default=0)
-    parser.add_argument("--method_warmup_epochs", type=int, default=0)
-    parser.add_argument("--early_stop_patience", type=int, default=3)
+    # augment
+    ap.add_argument("--mixup", type=float, default=0.0)
+    ap.add_argument("--cutmix", type=float, default=0.0)
+    ap.add_argument("--mixup_prob", type=float, default=0.0)
+    ap.add_argument("--color_jitter", type=float, default=0.3)
+    ap.add_argument("--rand_erase_p", type=float, default=0.25)
+    ap.add_argument("--random_resized_crop", action="store_true")
 
-    parser.add_argument("--val_use_ema", action="store_true")
-    parser.add_argument("--val_tta", type=str, default="none", choices=["none", "hflip"])
-    parser.add_argument("--grad_ckpt", action="store_true")
-    
-    # Constraint & eval-only
-    parser.add_argument("--cons_bacc_min", type=float, default=0.90)
-    parser.add_argument("--cons_rec_real_min", type=float, default=0.90)
-    parser.add_argument("--eval_only", action="store_true")
-    parser.add_argument("--eval_split", default="val", choices=["val", "test"])
+    # drops
+    ap.add_argument("--drop_rate", type=float, default=0.1)
+    ap.add_argument("--drop_path_rate", type=float, default=0.1)
 
-    args = parser.parse_args()
+    # optim
+    ap.add_argument("--lr", type=float, default=8e-6)
+    ap.add_argument("--warmup_steps", type=int, default=800)
+    ap.add_argument("--clip_grad", type=float, default=1.0)
+    ap.add_argument("--weight_decay", type=float, default=0.05)
 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
+    # threshold sweep
+    ap.add_argument("--thr_min", type=float, default=0.55)
+    ap.add_argument("--thr_max", type=float, default=0.90)
+    ap.add_argument("--thr_steps", type=int, default=101)
+
+    # run control
+    ap.add_argument("--resume", default="")
+    ap.add_argument("--freeze_epochs", type=int, default=0)
+    ap.add_argument("--method_warmup_epochs", type=int, default=0)
+    ap.add_argument("--early_stop_patience", type=int, default=3)
+    ap.add_argument("--grad_ckpt", action="store_true")
+    ap.add_argument("--val_tta", choices=["none","hflip"], default="none")
+    ap.add_argument("--cons_bacc_min", type=float, default=0.90)
+    ap.add_argument("--cons_rec_real_min", type=float, default=0.90)
+
+    # eval-only
+    ap.add_argument("--eval_only", action="store_true")
+    ap.add_argument("--eval_split", choices=["val","test"], default="val")
+    args=ap.parse_args()
+
+    torch.backends.cuda.matmul.allow_tf32=True
+    torch.backends.cudnn.allow_tf32=True
+    try: torch.set_float32_matmul_precision("high")
+    except: pass
 
     os.makedirs(args.out_dir, exist_ok=True)
+    device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    fake_root = os.path.join(args.data_root, "train", "fake")
-    method_names = []
-    if os.path.isdir(fake_root):
-        for d in sorted(os.listdir(fake_root)):
-            if os.path.isdir(os.path.join(fake_root, d)):
-                method_names.append(d)
-    print(f"📊 Phương pháp: {method_names if method_names else '[]'}")
-
-    tfm_train_list = []
+    # transforms
+    tfml=[]
     if args.random_resized_crop:
-        tfm_train_list.append(transforms.RandomResizedCrop(args.img_size, scale=(0.7, 1.0)))
+        tfml.append(transforms.RandomResizedCrop(args.img_size, scale=(0.7,1.0)))
     else:
-        tfm_train_list.append(transforms.Resize((args.img_size, args.img_size)))
-    tfm_train_list.extend([
-        transforms.RandomHorizontalFlip(p=0.5),
-    ])
-    if args.color_jitter > 0:
-        cj = args.color_jitter
-        tfm_train_list.append(transforms.ColorJitter(brightness=cj, contrast=cj, saturation=cj, hue=min(0.1, cj*0.5)))
-    tfm_train_list.extend([
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
-    if args.rand_erase_p > 0:
-        tfm_train_list.append(transforms.RandomErasing(p=args.rand_erase_p, scale=(0.02, 0.2), ratio=(0.3, 3.3), value='random'))
-    tfm_train = transforms.Compose(tfm_train_list)
+        tfml.append(transforms.Resize((args.img_size,args.img_size)))
+    tfml.append(transforms.RandomHorizontalFlip(0.5))
+    if args.color_jitter>0:
+        cj=args.color_jitter
+        tfml.append(transforms.ColorJitter(cj,cj,cj,min(0.1,cj*0.5)))
+    tfml += [transforms.ToTensor(), transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)]
+    if args.rand_erase_p>0:
+        tfml.append(transforms.RandomErasing(p=args.rand_erase_p, scale=(0.02,0.2), ratio=(0.3,3.3), value='random'))
+    tfm_train=transforms.Compose(tfml)
+    tfm_eval =transforms.Compose([transforms.Resize((args.img_size,args.img_size)),
+                                  transforms.ToTensor(),
+                                  transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
-    tfm_eval = transforms.Compose([
-        transforms.Resize((args.img_size, args.img_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    ])
+    # datasets
+    ds_train=MultiBranchDataset(args.data_root,'train',tfm_train)
+    ds_val  =MultiBranchDataset(args.data_root,'val',  tfm_eval)
 
-    ds_train = FacesDataset(args.data_root, 'train', method_names, tfm_train, face_crop=args.face_crop)
+    has_any_test = any(os.path.isdir(os.path.join(args.data_root, br, 'test')) for br in ['face','head','full'])
+    ds_test = MultiBranchDataset(args.data_root,'test', tfm_eval) if has_any_test else None
 
-    # Chuẩn bị sẵn VAL và TEST dataloaders (độc lập với eval_split khi train)
-    ds_val  = FacesDataset(args.data_root, 'val',  method_names, tfm_eval, face_crop=args.face_crop)
-    ds_test = FacesDataset(args.data_root, 'test', method_names, tfm_eval, face_crop=args.face_crop) \
-              if os.path.isdir(os.path.join(args.data_root, 'test')) else None
+    method_names = ds_train.method_names
+    print(f"📊 Method union: {method_names}")
+    print(f"📚 Branch classes: { {br: ds_train.branch_classnames[br] for br in ['face','head','full']} }")
 
-    print(f"🔎 Tổng ảnh TRAIN: {len(ds_train)} | theo lớp: {ds_train.per_class}")
-    print(f"🔎 Tổng ảnh VAL  : {len(ds_val)} | theo lớp: {ds_val.per_class}")
-    if ds_test is not None:
-        print(f"🔎 Tổng ảnh TEST : {len(ds_test)} | theo lớp: {ds_test.per_class}")
-    else:
-        print("ℹ️  Không tìm thấy split 'test' → sẽ bỏ qua đánh giá TEST sau mỗi epoch.")
+    def stat(ds):
+        return f"{len(ds)} | " + ", ".join([f"{k}:{v}" for k,v in ds.per_class.items()])
+    print(f"🔎 TRAIN: {stat(ds_train)}")
+    print(f"🔎 VAL  : {stat(ds_val)}")
+    if ds_test is not None: print(f"🔎 TEST : {stat(ds_test)}")
 
-    sampler = None
+    # sampler
+    sampler=None
     if args.balance_by_method:
-        boost = parse_method_boost(args.method_boost)
-        print(f"⚖️  Cân bằng theo method: BẬT | boost: {boost}")
-        weights = []
-        for _, yb, ym in ds_train.samples:
-            if yb == 1:
-                w = boost.get("real", 1.0)
+        boost=parse_method_boost(args.method_boost)
+        print(f"⚖️  Balance-by-method ON | boost={boost}")
+        w=[]
+        for _, yb, ym, ybr, _ in ds_train.samples:
+            if yb==1:
+                tag=f"real_{ID2BRANCH[ybr]}"
+                w.append(boost.get(tag, boost.get("real",1.0)))
             else:
-                mname = method_names[int(ym)]
-                w = boost.get(mname, 1.0)
-            weights.append(w)
-        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
-    if sampler is None and args.bin_balance_sampler:
-        n_fake = sum(1 for _, yb, _ in ds_train.samples if yb == 0)
-        n_real = sum(1 for _, yb, _ in ds_train.samples if yb == 1)
-        ratio = 1.0
-        if n_real > 0:
-            ratio = max(1.0, n_fake / float(n_real))
-        print(f"⚖️  Cân bằng nhị phân: BẬT | oversample real ×{ratio:.2f}")
-        weights = [ (ratio if yb == 1 else 1.0) for _, yb, _ in ds_train.samples ]
-        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+                w.append(boost.get(method_names[int(ym)], 1.0))
+        sampler=WeightedRandomSampler(w, num_samples=len(w), replacement=True)
+    elif args.bin_balance_sampler:
+        n_fake=sum(1 for _,yb,_,_,_ in ds_train.samples if yb==0)
+        n_real=sum(1 for _,yb,_,_,_ in ds_train.samples if yb==1)
+        ratio=max(1.0, (n_fake/float(n_real)) if n_real>0 else 1.0)
+        print(f"⚖️  Balance binary ON ×{ratio:.2f} (oversample real)")
+        w=[ (ratio if yb==1 else 1.0) for _,yb,_,_,_ in ds_train.samples ]
+        sampler=WeightedRandomSampler(w, num_samples=len(w), replacement=True)
     else:
-        if not args.balance_by_method:
-            print("⚖️  Cân bằng theo method: TẮT")
-        if not args.bin_balance_sampler:
-            print("⚖️  Cân bằng nhị phân: TẮT")
+        print("⚖️  No balancing")
 
-    accum_steps = max(1, args.batch_size // args.micro_batch)
-    print(f"🧮 Batch hiệu dụng = {args.batch_size} (micro_batch={args.micro_batch}, accum_steps={accum_steps})")
+    accum_steps=max(1, args.batch_size//args.micro_batch)
+    print(f"🧮 Effective batch={args.batch_size} (micro={args.micro_batch}, accum={accum_steps})")
 
-    dl_train = DataLoader(
-        ds_train,
-        batch_size=args.micro_batch,
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=args.workers,
-        pin_memory=True,
-        drop_last=True,
-        prefetch_factor=4,
-        persistent_workers=(args.workers>0)
-    )
-    dl_val = DataLoader(
-        ds_val,
-        batch_size=args.val_batch,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-        drop_last=False,
-        prefetch_factor=2,
-        persistent_workers=(args.workers>0)
-    )
-    dl_test = None
-    if ds_test is not None and len(ds_test) > 0:
-        dl_test = DataLoader(
-            ds_test,
-            batch_size=args.val_batch,
-            shuffle=False,
-            num_workers=args.workers,
-            pin_memory=True,
-            drop_last=False,
-            prefetch_factor=2,
-            persistent_workers=(args.workers>0)
-        )
+    dl_train=DataLoader(ds_train, batch_size=args.micro_batch, sampler=sampler,
+                        shuffle=(sampler is None), num_workers=args.workers,
+                        pin_memory=True, drop_last=True, prefetch_factor=4,
+                        persistent_workers=(args.workers>0))
+    dl_val  =DataLoader(ds_val, batch_size=args.val_batch, shuffle=False,
+                        num_workers=args.workers, pin_memory=True, drop_last=False,
+                        prefetch_factor=2, persistent_workers=(args.workers>0))
+    dl_test=None
+    if ds_test is not None and len(ds_test)>0:
+        dl_test=DataLoader(ds_test, batch_size=args.val_batch, shuffle=False,
+                           num_workers=args.workers, pin_memory=True, drop_last=False,
+                           prefetch_factor=2, persistent_workers=(args.workers>0))
 
-    model = MultiHeadViT(
+    model=MultiHeadViT(
         args.model, args.img_size, num_methods=len(method_names),
+        num_face_classes=len(ds_train.branch_classnames['face']),
+        num_head_classes=len(ds_train.branch_classnames['head']),
+        num_full_classes=len(ds_train.branch_classnames['full']),
         drop_rate=args.drop_rate, drop_path_rate=args.drop_path_rate
     ).to(device)
 
-    # Tiết kiệm VRAM cho ViT-Large
-    if args.grad_ckpt and hasattr(model.backbone, "set_grad_checkpointing"):
+    if args.grad_ckpt and hasattr(model.backbone,"set_grad_checkpointing"):
         model.backbone.set_grad_checkpointing(True)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
-    ema = EMA(model, decay=0.9999) if args.ema else None
+    opt=torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9,0.999), weight_decay=args.weight_decay)
+    scaler=torch.amp.GradScaler('cuda', enabled=(device.type=='cuda'))
+    ema = EMA(model, 0.9999) if args.ema else None
 
-    def set_backbone_requires_grad(req: bool):
-        for _, p in model.backbone.named_parameters():
-            p.requires_grad = req
+    # freeze backbone đầu
+    def set_backbone_grad(req: bool):
+        for p in model.backbone.parameters(): p.requires_grad=req
+    if args.freeze_epochs>0:
+        print(f"🧊 Freeze backbone {args.freeze_epochs} epoch đầu")
+        set_backbone_grad(False)
 
-    if args.freeze_epochs > 0:
-        print(f"🧊 Đóng băng backbone trong {args.freeze_epochs} epoch đầu")
-        set_backbone_requires_grad(False)
-
-    start_epoch = 1
-    best_metric = -1.0
-    epochs_no_improve = 0
+    start_epoch=1; best_metric=-1.0; epochs_no_improve=0
     if args.resume and os.path.isfile(args.resume):
-        ck = torch.load(args.resume, map_location='cpu', weights_only=False)
+        ck=torch.load(args.resume, map_location='cpu')
         model.load_state_dict(ck.get('model', ck), strict=False)
         if 'optimizer' in ck:
             try: opt.load_state_dict(ck['optimizer'])
@@ -551,280 +514,304 @@ def main():
             try: scaler.load_state_dict(ck['scaler'])
             except: pass
         if 'ema' in ck and ema is not None and isinstance(ck['ema'], dict):
-            ema.shadow = {k: v.to(device) for k, v in ck['ema'].items()}
-        if 'epoch' in ck:
-            start_epoch = int(ck['epoch']) + 1
-        if 'best_metric' in ck:
-            best_metric = float(ck['best_metric'])
-        print(f"↩️  Nạp trọng số từ {args.resume} | missing=0 | unexpected=0")
-        if 'epoch' in ck:
-            print(f"🔁 Resume tại epoch {start_epoch-1}. Sẽ train tiếp từ epoch {start_epoch} → {args.epochs} (log dạng Epoch {start_epoch}/{args.epochs}).")
+            ema.shadow={k:v.to(device) for k,v in ck['ema'].items()}
+        if 'epoch' in ck: start_epoch=int(ck['epoch'])+1
+        if 'best_metric' in ck: best_metric=float(ck['best_metric'])
+        print(f"↩️  Resume từ {args.resume} | epoch tiếp theo: {start_epoch}")
 
-    print(f"📂 Lưu model vào: {args.out_dir}")
-    print(f"🖼  Kích thước ảnh={args.img_size} | mô hình={args.model} | epochs={args.epochs}")
+    # lưu label map cho inference
+    with open(os.path.join(args.out_dir,"label_map.json"),"w",encoding="utf-8") as f:
+        json.dump({"method_names": method_names,
+                   "branch_classes": ds_train.branch_classnames}, f, ensure_ascii=False, indent=2)
 
-    # EVAL ONLY: chỉ chạy validation hoặc test (tùy eval_split) rồi thoát
+    # eval-only
     if args.eval_only:
-        # chọn loader theo eval_split
-        eval_loader = dl_val if args.eval_split == "val" else dl_test
-        if eval_loader is None:
-            raise RuntimeError(f"Không có dữ liệu cho split '{args.eval_split}'.")
-        val_res = evaluate(
-            model, eval_loader, device, method_names,
-            args.thr_min, args.thr_max,
-            method_loss_weight=args.method_loss_weight,
-            label_smoothing=args.label_smoothing,
-            use_ema=args.val_use_ema and (ema is not None),
-            ema_obj=ema,
-            val_tta=args.val_tta,
-            thr_steps=args.thr_steps,
-            cons_bacc_min=args.cons_bacc_min,
-            cons_rec_real_min=args.cons_rec_real_min
-        )
-        if val_res.get('cons_thr') is not None:
-            print(f"📌 Ngưỡng gợi ý (constraint): thr={val_res['cons_thr']:.3f} | acc={val_res['cons_acc']:.4f} | bacc={val_res['cons_bacc']:.4f} | rec_fake={val_res['cons_rec_fake']:.4f} | rec_real={val_res['cons_rec_real']:.4f}")
+        loader = dl_val if args.eval_split=="val" else dl_test
+        if loader is None: raise RuntimeError(f"Không có dữ liệu cho split '{args.eval_split}'.")
+        evaluate(model, loader, device, method_names,
+                 args.thr_min, args.thr_max, args.thr_steps,
+                 method_loss_weight=args.method_loss_weight,
+                 label_smoothing=args.label_smoothing,
+                 use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
+                 val_tta=args.val_tta,
+                 cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min)
         return
 
-    w_bin = torch.tensor([1.0, float(args.bin_weight_real)], dtype=torch.float, device=device)
-
-    def ce_bin_fn(logits, targets):
+    # losses
+    w_bin=torch.tensor([1.0, float(args.bin_weight_real)], dtype=torch.float, device=device)
+    def ce_bin(logits, targets):
         return focal_ce(logits, targets, weight=w_bin, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
-
-    def ce_met_fn(logits, targets):
+    def ce_met(logits, targets):
         return F.cross_entropy(logits, targets, label_smoothing=args.label_smoothing)
 
-    global_step = 0
-    def set_lr(optim, base_lr, step):
-        if args.warmup_steps > 0 and step < args.warmup_steps:
-            lr = base_lr * float(step + 1) / float(args.warmup_steps)
+    # lr schedule
+    global_step=0
+    def set_lr(step):
+        if args.warmup_steps>0 and step<args.warmup_steps:
+            lr=args.lr*float(step+1)/float(args.warmup_steps)
         else:
-            lr = base_lr
-        for pg in optim.param_groups:
-            pg['lr'] = lr
+            lr=args.lr
+        for pg in opt.param_groups: pg['lr']=lr
         return lr
 
-    interrupted = {'flag': False}
-    def handle_sigint(signum, frame):
-        interrupted['flag'] = True
-    signal.signal(signal.SIGINT, handle_sigint)
+    # log file init
+    csv_path=os.path.join(args.out_dir,"metrics_epoch.csv")
+    jsonl_path=os.path.join(args.out_dir,"metrics_epoch.jsonl")
+    if not os.path.exists(csv_path):
+        with open(csv_path,"w",newline="",encoding="utf-8") as f:
+            w=csv.writer(f)
+            w.writerow([
+                "epoch","time_min",
+                # train
+                "train_acc","train_bacc","train_rec_fake","train_rec_real","train_thr_star",
+                "train_acc_face_bin","train_acc_head_bin","train_acc_full_bin",
+                # val
+                "val_acc","val_bacc","val_rec_fake","val_rec_real","val_thr_star",
+                "val_method_acc_fake","val_acc_face_bin","val_acc_head_bin","val_acc_full_bin",
+                # test
+                "test_acc","test_bacc","test_rec_fake","test_rec_real","test_thr_star",
+                "test_method_acc_fake","test_acc_face_bin","test_acc_head_bin","test_acc_full_bin"
+            ])
 
-    for epoch in range(start_epoch, args.epochs + 1):
+    interrupted={'flag':False}
+    def on_sigint(sig,frame): interrupted['flag']=True
+    signal.signal(signal.SIGINT, on_sigint)
+
+    for epoch in range(start_epoch, args.epochs+1):
         model.train()
-        if args.freeze_epochs > 0 and epoch > args.freeze_epochs:
-            set_backbone_requires_grad(True)
+        if args.freeze_epochs>0 and epoch>args.freeze_epochs:
+            set_backbone_grad(True)
 
-        pbar = tqdm(dl_train, total=len(dl_train), dynamic_ncols=True,
-                    desc=f"[Epoch {epoch}/{args.epochs}]")
+        pbar=tqdm(dl_train, dynamic_ncols=True, desc=f"[Epoch {epoch}/{args.epochs}]")
         opt.zero_grad(set_to_none=True)
+        t_train0=time.time()
 
-        effective_method_w = (0.0 if epoch <= args.method_warmup_epochs else args.method_loss_weight)
+        eff_w_met = 0.0 if epoch<=args.method_warmup_epochs else args.method_loss_weight
 
-        tr_bin_logits, tr_bin_labels = [], []
-        tr_met_logits, tr_met_labels = [], []
-        t_train0 = time.time()
+        # số liệu train để tóm tắt sau epoch
+        logits_b_list=[]; labels_b_list=[]
+        logits_face_list=[]; labels_face_list=[]
+        logits_head_list=[]; labels_head_list=[]
+        logits_full_list=[]; labels_full_list=[]
+        logits_met_list=[]; labels_met_list=[]
 
-        for step, (x, yb, ym) in enumerate(pbar):
+        for step, batch in enumerate(pbar):
             if interrupted['flag']:
-                inter_path = os.path.join(args.out_dir, f"detector_interrupt_epoch{epoch}_step{step}.pt")
-                torch.save({
-                    'model': model.state_dict(),
-                    'optimizer': opt.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'ema': (ema.shadow if ema is not None else None),
-                    'epoch': epoch,
-                    'best_metric': best_metric
-                }, inter_path)
-                print(f"\n⛔ Đã dừng thủ công. Đã lưu checkpoint → {inter_path}")
+                ck=os.path.join(args.out_dir, f"detector_interrupt_e{epoch}_s{step}.pt")
+                torch.save({'model':model.state_dict(),'optimizer':opt.state_dict(),
+                            'scaler':scaler.state_dict(),'ema':(ema.shadow if ema else None),
+                            'epoch':epoch,'best_metric':best_metric}, ck)
+                print(f"\n⛔ Dừng thủ công. Đã lưu {ck}")
                 return
 
-            x  = x.to(device, non_blocking=True)
-            yb = yb.to(device, non_blocking=True)
-            ym = ym.to(device, non_blocking=True)
+            x,yb,ym,ybr,ybcls = batch
+            x=x.to(device); yb=yb.to(device); ym=ym.to(device); ybr=ybr.to(device); ybcls=ybcls.to(device)
 
-            x_in = x
-            soft_yb = None
-            applied_mix = False
-            if args.mixup_prob > 0.0 and (args.mixup > 0.0 or args.cutmix > 0.0):
-                x_in, soft_yb, applied_mix = apply_mix(x, yb, args.mixup, args.cutmix, args.mixup_prob)
+            x_in=x; soft_y=None; mixed=False
+            if args.mixup_prob>0 and (args.mixup>0 or args.cutmix>0):
+                x_in, soft_y, mixed = apply_mix(x,yb,args.mixup,args.cutmix,args.mixup_prob)
 
-            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
-                lb, lm = model(x_in)
-                if applied_mix:
-                    loss_b = soft_ce(lb.float(), soft_yb)
-                else:
-                    loss_b = ce_bin_fn(lb.float(), yb)
+            with torch.amp.autocast('cuda', enabled=(device.type=='cuda')):
+                lb,lm,lfa,lhe,lfu = model(x_in)
 
-                fake_mask = (yb == 0) & (ym >= 0)
-                if fake_mask.any() and effective_method_w > 0:
-                    loss_m_raw = ce_met_fn(lm[fake_mask].float(), ym[fake_mask])
-                else:
-                    loss_m_raw = torch.tensor(0.0, device=device)
+                # binary
+                loss_b = ( F.kl_div(F.log_softmax(lb.float(),1), soft_y, reduction='batchmean')
+                           if mixed else ce_bin(lb.float(), yb) )
 
-                loss = loss_b + effective_method_w * loss_m_raw
+                # method (fake-only)
+                loss_m=torch.tensor(0.0, device=device)
+                mask_fake=(yb==0) & (ym>=0)
+                if mask_fake.any() and eff_w_met>0:
+                    loss_m = ce_met(lm[mask_fake].float(), ym[mask_fake])
 
+                # branch CE đa lớp
+                loss_face=torch.tensor(0.0, device=device)
+                loss_head=torch.tensor(0.0, device=device)
+                loss_full=torch.tensor(0.0, device=device)
+
+                m_face=(ybr==BRANCH2ID['face'])
+                if m_face.any():
+                    loss_face = F.cross_entropy(lfa[m_face].float(), ybcls[m_face],
+                                                label_smoothing=args.label_smoothing)
+                m_head=(ybr==BRANCH2ID['head'])
+                if m_head.any():
+                    loss_head = F.cross_entropy(lhe[m_head].float(), ybcls[m_head],
+                                                label_smoothing=args.label_smoothing)
+                m_full=(ybr==BRANCH2ID['full'])
+                if m_full.any():
+                    loss_full = F.cross_entropy(lfu[m_full].float(), ybcls[m_full],
+                                                label_smoothing=args.label_smoothing)
+
+                loss = ( loss_b
+                         + eff_w_met*loss_m
+                         + args.face_head_loss_weight*loss_face
+                         + args.head_head_loss_weight*loss_head
+                         + args.full_head_loss_weight*loss_full )
+
+            # collect for train summary
             with torch.no_grad():
-                tr_bin_logits.append(lb.detach().float().cpu())
-                tr_bin_labels.append(yb.detach().cpu())
-                tr_met_logits.append(lm.detach().float().cpu())
-                tr_met_labels.append(ym.detach().cpu())
+                logits_b_list.append(lb.detach().float().cpu())
+                labels_b_list.append(yb.detach().cpu())
+                if m_face.any():
+                    logits_face_list.append(lfa[m_face].detach().float().cpu())
+                    labels_face_list.append(yb[m_face].detach().cpu())
+                if m_head.any():
+                    logits_head_list.append(lhe[m_head].detach().float().cpu())
+                    labels_head_list.append(yb[m_head].detach().cpu())
+                if m_full.any():
+                    logits_full_list.append(lfu[m_full].detach().float().cpu())
+                    labels_full_list.append(yb[m_full].detach().cpu())
+                if mask_fake.any():
+                    logits_met_list.append(lm[mask_fake].detach().float().cpu())
+                    labels_met_list.append(ym[mask_fake].detach().cpu())
 
-            loss = loss / max(1, args.batch_size // args.micro_batch)
+            # grad step
+            loss = loss / max(1, args.batch_size//args.micro_batch)
             scaler.scale(loss).backward()
-
-            do_step = ((step + 1) % max(1, args.batch_size // args.micro_batch)) == 0
+            do_step = ((step+1) % max(1,args.batch_size//args.micro_batch))==0
             if do_step:
-                if args.clip_grad and args.clip_grad > 0:
+                if args.clip_grad and args.clip_grad>0:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                scaler.step(opt)
-                scaler.update()
-                opt.zero_grad(set_to_none=True)
-                global_step += 1
-                set_lr(opt, args.lr, global_step)
-                if ema is not None:
-                    ema.update(model)
+                scaler.step(opt); scaler.update(); opt.zero_grad(set_to_none=True)
+                global_step+=1; set_lr(global_step)
+                if ema is not None: ema.update(model)
 
-            if (step % 2) == 0:
-                with torch.no_grad():
-                    probs_fake = torch.softmax(lb.float(), dim=1)[:, 0]
-                    thrs = torch.linspace(args.thr_min, args.thr_max, steps=41, device=probs_fake.device)
-                    best_acc_b, best_bacc_b, best_thr_b = 0.0, 0.0, float((args.thr_min + args.thr_max) / 2)
-                    m_fake = (yb == 0); m_real = (yb == 1)
-                    for t in thrs:
-                        pred_bin = torch.where(probs_fake >= t, torch.zeros_like(yb), torch.ones_like(yb))
-                        acc_b = (pred_bin == yb).float().mean().item()
-                        rec_fake = (pred_bin[m_fake] == 0).float().mean().item() if m_fake.any() else 0.0
-                        rec_real = (pred_bin[m_real] == 1).float().mean().item() if m_real.any() else 0.0
-                        bacc_b = 0.5 * (rec_fake + rec_real)
-                        if bacc_b > best_bacc_b:
-                            best_bacc_b, best_acc_b, best_thr_b = bacc_b, acc_b, float(t.item())
+            if (step%10)==0:
+                p_fake=torch.softmax(lb.detach().float(),dim=1)[:,0]
+                tmid=(args.thr_min+args.thr_max)/2
+                pred=(p_fake>=tmid).long()
+                pred=torch.where(pred==1, torch.zeros_like(pred), torch.ones_like(pred))
+                acc=(pred==yb).float().mean().item()
+                pbar.set_postfix_str(f"loss={loss.item():.4f} acc~={acc:.4f} lr={opt.param_groups[0]['lr']:.2e}")
 
-                    fake_mask_b = (yb == 0) & (ym >= 0)
-                    method_acc_b = 0.0
-                    if fake_mask_b.any():
-                        pred_m = lm[fake_mask_b].argmax(1)
-                        method_acc_b = (pred_m == ym[fake_mask_b]).float().mean().item()
-
-                pbar.set_postfix_str(
-                    f"loss={loss.item():.4f}, acc={best_acc_b:.4f}, bacc={best_bacc_b:.4f}, thr={best_thr_b:.3f}, m_acc={method_acc_b:.4f}, lr={opt.param_groups[0]['lr']:.2e}"
-                )
-
+        # ----- TRAIN summary (nhị phân + branch bin + method acc) -----
         with torch.no_grad():
-            lb_tr = torch.cat(tr_bin_logits, 0)
-            yb_tr = torch.cat(tr_bin_labels, 0)
-            lm_tr = torch.cat(tr_met_logits, 0)
-            ym_tr = torch.cat(tr_met_labels, 0)
-
-            loss_bin_tr = F.cross_entropy(lb_tr, yb_tr, label_smoothing=args.label_smoothing)
-            fake_mask_tr = (yb_tr == 0) & (ym_tr >= 0)
-            if fake_mask_tr.any() and args.method_loss_weight > 0:
-                loss_met_tr_raw = F.cross_entropy(lm_tr[fake_mask_tr], ym_tr[fake_mask_tr], label_smoothing=args.label_smoothing)
-            else:
-                loss_met_tr_raw = torch.tensor(0.0)
-
-            train_loss = (loss_bin_tr + args.method_loss_weight * loss_met_tr_raw).item()
-
-            probs_fake_tr = torch.softmax(lb_tr, dim=1)[:, 0]
-            thrs_tr = torch.linspace(args.thr_min, args.thr_max, steps=101)
-            best_acc_tr, best_bacc_tr, best_thr_tr = 0.0, 0.0, float((args.thr_min + args.thr_max) / 2)
-            best_rec_fake_tr, best_rec_real_tr = 0.0, 0.0
+            lb_tr=torch.cat(logits_b_list,0); yb_tr=torch.cat(labels_b_list,0)
+            thrs_tr=torch.linspace(args.thr_min,args.thr_max,steps=101)
+            probs=torch.softmax(lb_tr,dim=1)[:,0]
+            best_bacc=-1; best_acc=0; best_thr=float((args.thr_min+args.thr_max)/2); rf=rr=0
+            m_fake=(yb_tr==0); m_real=(yb_tr==1)
             for t in thrs_tr:
-                pred_bin_tr = torch.where(probs_fake_tr >= t, torch.zeros_like(yb_tr), torch.ones_like(yb_tr))
-                acc_tr = (pred_bin_tr == yb_tr).float().mean().item()
-                m_fake_tr = (yb_tr == 0); m_real_tr = (yb_tr == 1)
-                rec_fake_tr = (pred_bin_tr[m_fake_tr] == 0).float().mean().item() if m_fake_tr.any() else 0.0
-                rec_real_tr = (pred_bin_tr[m_real_tr] == 1).float().mean().item() if m_real_tr.any() else 0.0
-                bacc_tr = 0.5 * (rec_fake_tr + rec_real_tr)
-                if bacc_tr > best_bacc_tr:
-                    best_bacc_tr, best_acc_tr, best_thr_tr = bacc_tr, acc_tr, float(t.item())
-                    best_rec_fake_tr, best_rec_real_tr = rec_fake_tr, rec_real_tr
+                pred=torch.where(probs>=t, torch.zeros_like(yb_tr), torch.ones_like(yb_tr))
+                acc=(pred==yb_tr).float().mean().item()
+                recf=(pred[m_fake]==0).float().mean().item() if m_fake.any() else 0.0
+                recr=(pred[m_real]==1).float().mean().item() if m_real.any() else 0.0
+                bacc=0.5*(recf+recr)
+                if bacc>best_bacc:
+                    best_bacc, best_acc, best_thr, rf, rr = bacc, acc, float(t.item()), recf, recr
 
-            method_acc_tr = 0.0
-            if fake_mask_tr.any():
-                pred_m_tr = lm_tr[fake_mask_tr].argmax(1)
-                method_acc_tr = (pred_m_tr == ym_tr[fake_mask_tr]).float().mean().item()
+            def acc_from_lists(logits_list, labels_list):
+                if len(logits_list)==0: return None
+                l=torch.cat(logits_list,0); y=torch.cat(labels_list,0)
+                pred=l.argmax(1)
+                return float((pred==y).float().mean().item())
 
-            elapsed_train = time.time() - t_train0
-            print(
-                f"[KQ TRAIN] loss={train_loss:.4f} | loss_bin={loss_bin_tr.item():.4f} | "
-                f"loss_met={loss_met_tr_raw.item():.4f} (x{args.method_loss_weight:.2f}) | "
-                f"acc={best_acc_tr:.4f} | bacc={best_bacc_tr:.4f} | "
-                f"rec_fake={best_rec_fake_tr:.4f} | rec_real={best_rec_real_tr:.4f} | "
-                f"ngưỡng tốt={best_thr_tr:.3f} | acc phương pháp (fake)={method_acc_tr:.4f} | "
-                f"thời gian train={elapsed_train/60:.2f} phút"
-            )
+            acc_face_bin = acc_from_lists(logits_face_list, labels_face_list)
+            acc_head_bin = acc_from_lists(logits_head_list, labels_head_list)
+            acc_full_bin = acc_from_lists(logits_full_list, labels_full_list)
 
-        # === VAL sau mỗi epoch ===
+            macc = None
+            if len(logits_met_list)>0:
+                lm_tr=torch.cat(logits_met_list,0); ym_tr=torch.cat(labels_met_list,0)
+                macc=float((lm_tr.argmax(1)==ym_tr).float().mean().item())
+
+        print(f"[KQ TRAIN] acc={best_acc:.4f} | bacc={best_bacc:.4f} | rec_fake={rf:.4f} | rec_real={rr:.4f} | thr*={best_thr:.3f} | m_acc(fake)={macc}")
+
+        # ----- VAL -----
         val_res = evaluate(
             model, dl_val, device, method_names,
-            args.thr_min, args.thr_max,
+            args.thr_min, args.thr_max, args.thr_steps,
             method_loss_weight=args.method_loss_weight,
             label_smoothing=args.label_smoothing,
-            use_ema=args.val_use_ema and (ema is not None),
-            ema_obj=ema,
+            use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
             val_tta=args.val_tta,
-            thr_steps=args.thr_steps,
-            cons_bacc_min=args.cons_bacc_min,
-            cons_rec_real_min=args.cons_rec_real_min
+            cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min
+            , phase_name="VAL"
         )
 
-        # === TEST sau mỗi epoch (nếu có dữ liệu test) ===
-        test_res = None
+        # ----- TEST (nếu có) -----
+        test_res=None
         if dl_test is not None:
             print("\n[ĐÁNH GIÁ TEST] ——")
             test_res = evaluate(
                 model, dl_test, device, method_names,
-                args.thr_min, args.thr_max,
+                args.thr_min, args.thr_max, args.thr_steps,
                 method_loss_weight=args.method_loss_weight,
                 label_smoothing=args.label_smoothing,
-                use_ema=args.val_use_ema and (ema is not None),
-                ema_obj=ema,
+                use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
                 val_tta=args.val_tta,
-                thr_steps=args.thr_steps,
-                cons_bacc_min=args.cons_bacc_min,
-                cons_rec_real_min=args.cons_rec_real_min
-            )
-            # In rút gọn theo best thr từ test
-            print(
-                f"[KQ TEST] acc={test_res['acc']:.4f} | bacc={test_res['bacc']:.4f} | "
-                f"rec_fake={test_res['rec_fake']:.4f} | rec_real={test_res['rec_real']:.4f} | "
-                f"ngưỡng tốt={test_res['best_thr']:.3f} | acc phương pháp (fake)={test_res['method_acc_fake']:.4f}"
+                cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min
+                , phase_name="TEST"
             )
 
-        # Lưu best theo VAL như trước
+        # ----- LOGGING (CSV + JSONL) -----
+        row = {
+            "epoch": epoch,
+            "time_min": round((time.time()-t_train0)/60.0, 3),
+
+            "train_acc": best_acc, "train_bacc": best_bacc,
+            "train_rec_fake": rf, "train_rec_real": rr,
+            "train_thr_star": best_thr,
+            "train_acc_face_bin": acc_face_bin,
+            "train_acc_head_bin": acc_head_bin,
+            "train_acc_full_bin": acc_full_bin,
+
+            "val_acc": val_res["acc"], "val_bacc": val_res["bacc"],
+            "val_rec_fake": val_res["rec_fake"], "val_rec_real": val_res["rec_real"],
+            "val_thr_star": val_res["best_thr"],
+            "val_method_acc_fake": val_res["method_acc_fake"],
+            "val_acc_face_bin": val_res["acc_face_bin"],
+            "val_acc_head_bin": val_res["acc_head_bin"],
+            "val_acc_full_bin": val_res["acc_full_bin"],
+
+            "test_acc": (None if test_res is None else test_res["acc"]),
+            "test_bacc": (None if test_res is None else test_res["bacc"]),
+            "test_rec_fake": (None if test_res is None else test_res["rec_fake"]),
+            "test_rec_real": (None if test_res is None else test_res["rec_real"]),
+            "test_thr_star": (None if test_res is None else test_res["best_thr"]),
+            "test_method_acc_fake": (None if test_res is None else test_res["method_acc_fake"]),
+            "test_acc_face_bin": (None if test_res is None else test_res["acc_face_bin"]),
+            "test_acc_head_bin": (None if test_res is None else test_res["acc_head_bin"]),
+            "test_acc_full_bin": (None if test_res is None else test_res["acc_full_bin"]),
+        }
+        # CSV
+        with open(csv_path,"a",newline="",encoding="utf-8") as f:
+            w=csv.writer(f)
+            w.writerow([row[k] for k in [
+                "epoch","time_min",
+                "train_acc","train_bacc","train_rec_fake","train_rec_real","train_thr_star",
+                "train_acc_face_bin","train_acc_head_bin","train_acc_full_bin",
+                "val_acc","val_bacc","val_rec_fake","val_rec_real","val_thr_star",
+                "val_method_acc_fake","val_acc_face_bin","val_acc_head_bin","val_acc_full_bin",
+                "test_acc","test_bacc","test_rec_fake","test_rec_real","test_thr_star",
+                "test_method_acc_fake","test_acc_face_bin","test_acc_head_bin","test_acc_full_bin"
+            ]])
+        # JSONL
+        with open(jsonl_path,"a",encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False)+"\n")
+
+        # ----- SAVE -----
         improved = val_res['bacc'] > best_metric
         if improved:
-            best_metric = val_res['bacc']
-            epochs_no_improve = 0
-            best_path = os.path.join(args.out_dir, "detector_best.pt")
-            torch.save({
-                'model': model.state_dict(),
-                'optimizer': opt.state_dict(),
-                'scaler': scaler.state_dict(),
-                'ema': (ema.shadow if ema is not None else None),
-                'epoch': epoch,
-                'best_metric': best_metric,
-                'best_thr': val_res.get('best_thr', None)  # lưu kèm best_thr (theo VAL)
-            }, best_path)
-            print(f"💾 Đã lưu mô hình BEST → {best_path} (best_thr={val_res.get('best_thr', None)})")
+            best_metric = val_res['bacc']; epochs_no_improve=0
+            best_path=os.path.join(args.out_dir,"detector_best.pt")
+            torch.save({'model':model.state_dict(),'optimizer':opt.state_dict(),
+                        'scaler':scaler.state_dict(),'ema':(ema.shadow if ema else None),
+                        'epoch':epoch,'best_metric':best_metric,
+                        'best_thr':val_res.get('best_thr',None)}, best_path)
+            print(f"💾 Lưu BEST → {best_path} (thr*={val_res.get('best_thr',None)})")
         else:
-            epochs_no_improve += 1
+            epochs_no_improve+=1
 
-        # Lưu checkpoint theo epoch (bao gồm tóm tắt số liệu val/test)
-        ep_path = os.path.join(args.out_dir, f"detector_epoch{epoch}.pt")
-        torch.save({
-            'model': model.state_dict(),
-            'optimizer': opt.state_dict(),
-            'scaler': scaler.state_dict(),
-            'ema': (ema.shadow if ema is not None else None),
-            'epoch': epoch,
-            'best_metric': best_metric,
-            'val_summary': val_res,
-            'test_summary': test_res
-        }, ep_path)
+        ep_path=os.path.join(args.out_dir, f"detector_epoch{epoch}.pt")
+        torch.save({'model':model.state_dict(),'optimizer':opt.state_dict(),
+                    'scaler':scaler.state_dict(),'ema':(ema.shadow if ema else None),
+                    'epoch':epoch,'best_metric':best_metric,
+                    'val_summary':val_res,'test_summary':test_res}, ep_path)
 
-        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
-            print(f"🛑 Early stopping vì không cải thiện BACC trong {args.early_stop_patience} epoch.")
+        if args.early_stop_patience>0 and epochs_no_improve>=args.early_stop_patience:
+            print(f"🛑 Early stopping sau {args.early_stop_patience} epoch không cải thiện BACC.")
             break
 
     print("✅ Train xong.")

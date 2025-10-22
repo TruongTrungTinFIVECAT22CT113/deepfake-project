@@ -1,5 +1,5 @@
 import numpy as np
-import cv2
+import cv2, tempfile, os
 
 def draw_box_np(img_rgb, box, color=(255, 0, 0), thickness=3):
     x0, y0, x1, y1 = map(int, box)
@@ -104,3 +104,14 @@ def get_thr_for_method(global_thr: float, method_name: str, thr_map: dict, per_m
     if per_method_on and gate_ok and method_name in thr_map:
         return float(thr_map[method_name])
     return float(global_thr)
+def save_bytes_to_temp(data: bytes, suffix=".mp4") -> str:
+    """
+    Lưu bytes upload tạm thời vào ổ đĩa (trong thư mục hệ thống).
+    Trả về đường dẫn file.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="df_upload_")
+    fname = os.path.join(tmpdir, "upload" + (suffix if suffix else ".bin"))
+    with open(fname, "wb") as f:
+        f.write(data)
+    return fname
+

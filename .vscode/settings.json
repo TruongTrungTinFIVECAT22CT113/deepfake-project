@@ -1,3 +1,9 @@
 {
-    "git.ignoreLimitWarning": true
+  "python.analysis.extraPaths": [
+    "backend",
+    "backend/components"
+  ],
+  "python.analysis.diagnosticMode": "workspace",
+      "git.ignoreLimitWarning": true
+  
 }
