@@ -130,6 +130,7 @@ def analyze_video(
     mnames = list(method_names or [])
     m_count = {m: 0 for m in mnames}
     backend_used_final = None
+    frame_tags: List[str] = []  # NEW: per-frame label ("Real" or method name)
 
     while True:
         ok, frame_bgr = cap.read()
@@ -149,9 +150,9 @@ def analyze_video(
                 bbox_scale=float(bbox_scale),
                 allow_fallback=allow_fallback,
             )
-        except Exception as e:
-            # if detector fails and no fallback: mark as no-face -> behave like eval (ok=False) => don't increment fake, but n_frames vẫn tăng
-            # To mimic eval more strictly, we'll just continue without counting fake
+        except Exception:
+            # if detector fails and no fallback: behave like eval (ok=False) => don't increment fake; still count frame
+            frame_tags.append("Real")
             continue
 
         if backend_used_final is None:
@@ -161,7 +162,7 @@ def analyze_video(
         # rebuild BGR crop exactly like backend_eval.square_crop_from_bbox
         crop_bgr = frame_bgr[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
         if crop_bgr.size == 0:
-            # behave like eval: skip counting this frame as fake
+            frame_tags.append("Real")
             continue
 
         pf, pr, pm = _ensemble_predict_bgr_crop(detectors_info, crop_bgr, tx, mnames)
@@ -171,6 +172,11 @@ def analyze_video(
             if len(mnames) > 0:
                 m_idx = int(np.argmax(pm))
                 m_count[mnames[m_idx]] += 1
+                frame_tags.append(mnames[m_idx])   # tag = method name
+            else:
+                frame_tags.append("Fake")
+        else:
+            frame_tags.append("Real")
 
         # draw box+label on RGB frame for output video only
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -211,13 +217,13 @@ def analyze_video(
     if len(mnames) > 0:
         counts = np.array([m_count[m] for m in mnames], dtype=np.float64)
 
-        # A) % by fake frames (giữ để tương thích)
+        # A) % by fake frames (compat)
         if fake_frames > 0 and counts.sum() > 0:
             perc_fake = 100.0 * counts / counts.sum()
             idx = np.argsort(-perc_fake)
             method_rows_fake = [(mnames[int(i)], float(perc_fake[int(i)])) for i in idx]
 
-        # B) % by total frames (mới – tránh hiểu lầm)
+        # B) % by total frames (clearer)
         if frames_total > 0:
             perc_total = 100.0 * counts / float(frames_total)
             idx2 = np.argsort(-perc_total)
@@ -233,6 +239,7 @@ def analyze_video(
         "thr_override_ignored": bool(thr_override_ignored),
         "detector_backend_used": backend_used_final or requested_backend,
         "method_distribution": {k: int(v) for k, v in m_count.items()},
+        "frame_tags": frame_tags,  # NEW: per-frame timeline labels
     }
 
     # Trả cả 2: FE sẽ ưu tiên *_total

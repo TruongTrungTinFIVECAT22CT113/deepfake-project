@@ -233,6 +233,7 @@ async def analyze(
             "method_rows_fake": method_rows_fake,
             "method_rows": method_rows_total,  # legacy
             "method_distribution": counts,
+            "frame_tags": stats.get("frame_tags", []),
         }
     finally:
         try:

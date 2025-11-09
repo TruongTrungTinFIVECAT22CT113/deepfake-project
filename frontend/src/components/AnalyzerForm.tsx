@@ -161,10 +161,10 @@ export default function AnalyzerForm({
             <div>Detector</div>
             <div className="segmented" role="group" aria-label="Detector">
               <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={()=>setDetectorBackend("retinaface")}>
-                RetinaFace (default)
+                RetinaFace (for-GPU)
               </button>
               <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={()=>setDetectorBackend("mediapipe")}>
-                MediaPipe
+                MediaPipe (CPU-only)
               </button>
             </div>
           </div>
