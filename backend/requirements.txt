@@ -1,10 +1,2 @@
 fastapi
 uvicorn[standard]
-numpy
-opencv-python
-pillow
-imageio
-torch
-torchvision
-timm
-mediapipe

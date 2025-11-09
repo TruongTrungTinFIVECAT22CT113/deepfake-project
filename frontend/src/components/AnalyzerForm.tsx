@@ -13,19 +13,24 @@ export default function AnalyzerForm({
 }): JSX.Element {
   const fileRef = useRef<HTMLInputElement>(null);
   const { addToast } = useToast();
+
+  // File
   const [picked, setPicked] = useState<File | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const [fileInfo, setFileInfo] = useState<{ name: string; size: string; duration?: number } | null>(null);
 
-  const [faceCrop, setFaceCrop] = useState(true);
-  const [autoThr, setAutoThr] = useState(true);
-  const [thr, setThr] = useState(0.5);
-  const [tta, setTta] = useState(2);
-  const [thick, setThick] = useState(3);
-  const [enableFilters, setEnableFilters] = useState(true);
-  const [methodGate, setMethodGate] = useState(0.55);
-  const [salDensity, setSalDensity] = useState(0.02);
+  // Basic
   const [duration, setDuration] = useState<string>("");
+
+  // Advanced
+  const [detectorBackend, setDetectorBackend] = useState<"retinaface" | "mediapipe">("retinaface");
+  const [bboxScale, setBboxScale] = useState(1.10);
+  const [thickness, setThickness] = useState(3);
+  const [thrOverride, setThrOverride] = useState<string>(""); // empty = not sending
+
+  // Derived: multiple models?
+  const numEnabled = enabledIds?.length ?? 0;
+  const isMultiModel = numEnabled >= 2;
 
   function formatBytes(b: number) {
     const units = ["B","KB","MB","GB"]; let i = 0; let v = b;
@@ -38,8 +43,8 @@ export default function AnalyzerForm({
     setFileInfo({ name: f.name, size: formatBytes(f.size) });
     try {
       const url = URL.createObjectURL(f);
-      const v = document.createElement('video');
-      v.preload = 'metadata';
+      const v = document.createElement("video");
+      v.preload = "metadata";
       v.src = url;
       v.onloadedmetadata = () => {
         setFileInfo({ name: f.name, size: formatBytes(f.size), duration: Number(v.duration || 0) });
@@ -51,8 +56,8 @@ export default function AnalyzerForm({
   useEffect(() => {
     const input = fileRef.current; if (!input) return;
     const onChange = () => { const f = input.files?.[0]; if (f) setFile(f); };
-    input.addEventListener('change', onChange);
-    return () => input.removeEventListener('change', onChange);
+    input.addEventListener("change", onChange);
+    return () => input.removeEventListener("change", onChange);
   }, []);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -60,30 +65,42 @@ export default function AnalyzerForm({
     const f = picked || fileRef.current?.files?.[0];
     if (!f) { addToast("Please choose a video file", "error"); return; }
 
+    // duration parse
     const dur = duration.trim() === "" ? undefined : Number(duration);
     if (dur !== undefined && (isNaN(dur) || dur < 0)) {
       addToast("Duration must be >= 0 seconds or empty", "error");
       return;
     }
 
+    // thr override parse (only allow when single model enabled)
+    let thr: number | null = null;
+    if (!isMultiModel && thrOverride.trim() !== "") {
+      const t = Number(thrOverride.trim());
+      if (!Number.isFinite(t) || t < 0 || t > 1) {
+        addToast("Threshold override must be in [0,1]", "error");
+        return;
+      }
+      thr = t;
+    }
+
     const opts: AnalyzeOptions = {
-      face_crop: faceCrop,
-      auto_thr: autoThr,
-      thr,
-      tta,
-      thickness: thick,
-      enable_filters: enableFilters,
-      method_gate: methodGate,
-      saliency_density: salDensity,
+      detector_backend: detectorBackend,
+      bbox_scale: bboxScale,
+      thickness: thickness,
       duration_sec: dur,
-      ...(enabledIds && enabledIds.length ? { enabled_ids_csv: enabledIds.join(",") } : {}),
+      enabled_ids_csv: enabledIds && enabledIds.length ? enabledIds.join(",") : undefined,
+      thr: thr ?? undefined, // BE will ignore if multiple models
     };
 
     setLoading(true);
     try {
       const res = await analyzeVideo(f, opts);
       onResult(res);
-      addToast("Analysis complete", "success");
+      if (res?.thr_override_ignored) {
+        addToast("Multiple models enabled → using average threshold; override ignored. Warning");
+      } else {
+        addToast("Analysis complete", "success");
+      }
     } catch (err: any) {
       addToast(err?.message || "Analyze failed", "error");
     } finally {
@@ -93,14 +110,15 @@ export default function AnalyzerForm({
 
   return (
     <form onSubmit={handleSubmit} className="stack">
-      <input id="file" type="file" ref={fileRef} accept="video/*" style={{display:'none'}} />
+      {/* Video input */}
+      <input id="file" type="file" ref={fileRef} accept="video/*" style={{display:"none"}} />
       <div className="row">
         <div>Video file</div>
         <div
-          className={`dropzone ${dragOver ? 'drag' : ''}`}
+          className={`dropzone ${dragOver ? "drag" : ""}`}
           onDragOver={(e)=>{ e.preventDefault(); setDragOver(true); }}
           onDragLeave={()=> setDragOver(false)}
-          onDrop={(e)=>{ e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f && f.type.startsWith('video/')) setFile(f); }}
+          onDrop={(e)=>{ e.preventDefault(); setDragOver(false); const f = e.dataTransfer.files?.[0]; if (f && f.type.startsWith("video/")) setFile(f); }}
           onClick={()=> fileRef.current?.click()}
         >
           <div className="meta">
@@ -117,71 +135,71 @@ export default function AnalyzerForm({
         </div>
       </div>
 
+      {/* Basic */}
       <div className="row">
-        <div>Basic settings</div>
+        <div>Basic</div>
         <div className="stack">
-          <label className="inline">
-            <input type="checkbox" checked={faceCrop}
-                   onChange={(e) => setFaceCrop(e.target.checked)} /> Face crop
-          </label>
-
-          <label className="inline">
-            <input type="checkbox" checked={autoThr}
-                   onChange={(e) => setAutoThr(e.target.checked)} /> Auto threshold
-          </label>
-
-          <div className="slider-row">
-            <div className="muted" style={{marginBottom:6}}>Detection threshold</div>
-            {(() => {
-              const min = 0.10, max = 0.99; const pct = ((thr - min) / (max - min)) * 100; const style = { ['--x' as any]: `${pct}%` } as React.CSSProperties;
-              return <div className="bubble" style={style}><b>{thr.toFixed(3)}</b></div>;
-            })()}
-            <input type="range" min="0.10" max="0.99" step="0.005"
-                   value={thr} onChange={(e) => setThr(parseFloat(e.target.value))}
-                   disabled={autoThr} />
-            <div className="help">Disable auto threshold to adjust manually.</div>
-          </div>
-
-          <div className="row" style={{alignItems:'center'}}>
-            <div>TTA</div>
-            <input type="number" min={1} max={4}
-                   value={tta} onChange={(e)=>setTta(parseInt(e.target.value || "1"))}/>
-          </div>
-
-          <div className="row" style={{alignItems:'center'}}>
+          <div className="row" style={{alignItems:"center"}}>
             <div>Duration (sec, optional)</div>
-            <input type="number" min={0} step={0.1}
-                   placeholder="Empty = full video"
-                   value={duration} onChange={(e)=>setDuration(e.target.value)} />
+            <input
+              type="number"
+              min={0}
+              step={0.1}
+              placeholder="Empty = full video"
+              value={duration}
+              onChange={(e)=>setDuration(e.target.value)}
+            />
           </div>
         </div>
       </div>
 
-      <details className="card">
-        <summary>Advanced options</summary>
+      {/* Advanced */}
+      <details className="card" open>
+        <summary>Advanced settings</summary>
         <div className="stack">
+          <div className="row">
+            <div>Detector</div>
+            <div className="segmented" role="group" aria-label="Detector">
+              <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={()=>setDetectorBackend("retinaface")}>
+                RetinaFace (default)
+              </button>
+              <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={()=>setDetectorBackend("mediapipe")}>
+                MediaPipe
+              </button>
+            </div>
+          </div>
+
+          <div className="row">
+            <div>BBox scale</div>
+            <input type="number" step={0.01} min={1.0} max={1.6}
+                   value={bboxScale} onChange={(e)=>setBboxScale(parseFloat(e.target.value || "1.10"))}/>
+          </div>
+
           <div className="row">
             <div>Box thickness</div>
             <input type="number" min={1} max={8}
-                   value={thick} onChange={(e)=>setThick(parseInt(e.target.value || "3"))}/>
-          </div>
-
-          <label className="inline">
-            <input type="checkbox" checked={enableFilters}
-                   onChange={(e)=>setEnableFilters(e.target.checked)} /> Enable method-based filters
-          </label>
-
-          <div className="row">
-            <div>Method gate</div>
-            <input type="number" step={0.01}
-                   value={methodGate} onChange={(e)=>setMethodGate(parseFloat(e.target.value || "0.55"))}/>
+                   value={thickness} onChange={(e)=>setThickness(parseInt(e.target.value || "3"))}/>
           </div>
 
           <div className="row">
-            <div>Saliency density</div>
-            <input type="number" step={0.005}
-                   value={salDensity} onChange={(e)=>setSalDensity(parseFloat(e.target.value || "0.02"))}/>
+            <div>Threshold override</div>
+            <input
+              type="number"
+              step={0.001}
+              min={0}
+              max={1}
+              placeholder="0.00 - 1.00"
+              value={thrOverride}
+              onChange={(e)=>setThrOverride(e.target.value)}
+              disabled={isMultiModel}
+            />
           </div>
+
+          {isMultiModel && (
+            <div className="muted">
+              Multiple models are enabled. The backend will use the <b>average threshold</b> and ignore override.
+            </div>
+          )}
         </div>
       </details>
 

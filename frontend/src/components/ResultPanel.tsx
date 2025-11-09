@@ -1,25 +1,19 @@
 import React, { useRef, useState, useEffect } from "react";
 
-// Fallback parsing cho backend cũ
-function extractFramesLine(html: string): string | null {
-  const text = html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  const m = text.match(/Frames:\s*\d+\s*\|\s*Fake-frames:\s*\d+\s*\(\d+(?:\.\d+)?%\)/i);
-  return m ? m[0] : null;
-}
-
 type NewFields = {
   frames_total?: number;
   fake_frames?: number;
   fake_ratio?: number;    // 0..1
   threshold_used?: number;
+  thr_override_ignored?: boolean;
+  detector_backend_used?: string;
 };
 
 export default function ResultPanel(props: {
   result?: {
     verdict: string;
     video_url: string;
-    method_rows: [string, number][];
-    fake_real_bar_html?: string;
+    method_rows?: [string, number][];
   } & NewFields;
   loading?: boolean;
 }): JSX.Element | null {
@@ -40,11 +34,10 @@ export default function ResultPanel(props: {
   }
   if (!r) return <div className="muted">No result yet. Upload a video and analyze.</div>;
 
-  // Ưu tiên số liệu mới; thiếu thì fallback qua HTML
   const framesLine =
-    r.frames_total && r.fake_frames && r.fake_ratio !== undefined
+    r.frames_total !== undefined && r.fake_frames !== undefined && r.fake_ratio !== undefined
       ? `Frames: ${r.frames_total} | Fake-frames: ${r.fake_frames} (${(r.fake_ratio * 100).toFixed(1)}%)`
-      : (r.fake_real_bar_html ? extractFramesLine(r.fake_real_bar_html) : null);
+      : null;
 
   return (
     <div className="stack">
@@ -57,18 +50,18 @@ export default function ResultPanel(props: {
       </div>
 
       {framesLine && <div style={{ fontWeight: 600 }}>{framesLine}</div>}
+
       {typeof r.threshold_used === "number" && (
         <div className="muted">Threshold used: <b>{r.threshold_used.toFixed(3)}</b></div>
       )}
+      {r.detector_backend_used && (
+        <div className="muted">Detector used: <b>{r.detector_backend_used}</b></div>
+      )}
+      {r.thr_override_ignored && (
+        <div className="warn">Multiple models enabled → average threshold used (override ignored).</div>
+      )}
 
-      <div className="actions">
-        <a className="btn small" href={r.video_url} download>Download result</a>
-        <button className="btn small btn-ghost" onClick={() => navigator.clipboard?.writeText(window.location.origin + r.video_url)}>
-          Copy link
-        </button>
-      </div>
-
-      {r.method_rows?.length > 0 && (
+      {r.method_rows?.length ? (
         <div className="stack">
           <div className="section-title">Method distribution (fake frames)</div>
           <table className="pretty">
@@ -84,7 +77,14 @@ export default function ResultPanel(props: {
             </tbody>
           </table>
         </div>
-      )}
+      ) : null}
+
+      <div className="actions">
+        <a className="btn small" href={r.video_url} download>Download result</a>
+        <button className="btn small btn-ghost" onClick={() => navigator.clipboard?.writeText(window.location.origin + r.video_url)}>
+          Copy link
+        </button>
+      </div>
     </div>
   );
 }

@@ -1,5 +1,5 @@
-# deepfake_detector/src/train_vit.py
-import os, re, time, json, math, random, signal, argparse, csv
+# deepfake_detector/src/train_vit.py  — face-only dataset loader (no head/full scanning), EMA như train_gru.py
+import os, re, time, json, math, random, signal, argparse, csv, gc
 from typing import List, Tuple, Dict
 
 import torch
@@ -42,14 +42,20 @@ def parse_method_boost(s: str) -> Dict[str, float]:
             except: pass
     return out
 
-# -------------- dataset (auto-discovery) --------------
+# -------------- dataset (FACE-ONLY, new layout) --------------
 class MultiBranchDataset(Dataset):
     """
-    Cấu trúc:
+    New layout (face-only):
       data_root/
-        face|head|full / train|val|test / <submethod> / <video-id> / 000000.jpg ...
-    - Real_*: 'real_face' / 'real_head' / 'real_full'
-    - Fake : các tên còn lại
+        face/
+          train|val|test/
+            real/<DatasetName>/<video-id>/000000.jpg ...
+            fake/<MethodName>/<video-id>/000000.jpg ...
+
+    - Binary label (yb): real=1, fake=0
+    - Method label (ym): index in union of fake methods (for fake only), else -1
+    - Branch id (ybr): always 0 ('face') for all samples
+    - Branch-class (ybcls): multi-class over ["real_face"] + sorted(face methods) for face-branch
     """
     def __init__(self, data_root: str, split: str, tfm):
         self.data_root = data_root
@@ -59,61 +65,61 @@ class MultiBranchDataset(Dataset):
         self.samples: List[Tuple[str,int,int,int,int]] = []  # (path, y_bin, y_met, y_branch, y_branch_cls)
         self.branch_methods = { 'face': set(), 'head': set(), 'full': set() }
 
-        tmp: List[Tuple[str,int,str,int]] = []  # (path, yb, ym_name|-1, y_branch)
-        for br in ["face","head","full"]:
-            split_dir = os.path.join(data_root, br, split)
-            if not os.path.isdir(split_dir):
-                continue
+        split_dir = os.path.join(data_root, "face", split)
 
-            # 1) REAL: real_face / real_head / real_full
-            real_dir = os.path.join(split_dir, f"real_{br}")
-            if os.path.isdir(real_dir):
-                for img in list_images(real_dir):
-                    tmp.append((img, 1, -1, BRANCH2ID[br]))
+        # 1) REAL (face/…/real/<DatasetName>/<video-id>/*.jpg)
+        real_root = os.path.join(split_dir, "real")
+        if os.path.isdir(real_root):
+            for ds in sorted([d for d in os.listdir(real_root) if os.path.isdir(os.path.join(real_root, d))]):
+                ds_dir = os.path.join(real_root, ds)
+                for img in list_images(ds_dir):
+                    # real sample → yb=1, ym=-1, branch=face
+                    self.samples.append((img, 1, -1, BRANCH2ID["face"], 0))  # ybcls tạm set 0, cập nhật sau
 
-            # 2) FAKE: fake_face/*method*/..., fake_head/*method*/..., fake_full/*method*/...
-            fake_root = os.path.join(split_dir, f"fake_{br}")
-            if os.path.isdir(fake_root):
-                for method_name in sorted([d for d in os.listdir(fake_root)
-                                           if os.path.isdir(os.path.join(fake_root, d))]):
-                    self.branch_methods[br].add(method_name)
-                    method_dir = os.path.join(fake_root, method_name)
-                    for img in list_images(method_dir):
-                        tmp.append((img, 0, method_name, BRANCH2ID[br]))
+        # 2) FAKE (face/…/fake/<Method>/<video-id>/*.jpg)
+        fake_root = os.path.join(split_dir, "fake")
+        face_methods = []
+        if os.path.isdir(fake_root):
+            face_methods = sorted([d for d in os.listdir(fake_root) if os.path.isdir(os.path.join(fake_root, d))])
+            for mname in face_methods:
+                self.branch_methods['face'].add(mname)
+                m_dir = os.path.join(fake_root, mname)
+                for img in list_images(m_dir):
+                    self.samples.append((img, 0, mname, BRANCH2ID["face"], -1))  # ybcls cập nhật sau
 
-        # union fake methods cho head_met
-        self.method_names = sorted({m for s in self.branch_methods.values() for m in s})
+        # union method set
+        self.method_names = sorted(self.branch_methods['face'])
         self.method_to_idx = {m:i for i,m in enumerate(self.method_names)}
 
-        # lớp theo từng branch: real_* + fake của branch đó
+        # branch classes (face-only); head/full để rỗng để giữ tương thích code khác
         self.branch_classnames = {
-            'face': ["real_face"] + sorted(self.branch_methods['face']),
-            'head': ["real_head"] + sorted(self.branch_methods['head']),
-            'full': ["real_full"] + sorted(self.branch_methods['full']),
+            'face': ["real_face"] + self.method_names,
+            'head': [],
+            'full': [],
         }
         self.branch_class_to_idx = {
-            br: {n:i for i,n in enumerate(names)}
-            for br, names in self.branch_classnames.items()
+            'face': {n:i for i,n in enumerate(self.branch_classnames['face'])},
+            'head': {},
+            'full': {},
         }
 
-        # build samples cuối
-        for p, yb, ym_name, ybr in tmp:
-            br = ID2BRANCH[ybr]
+        # finalize y_branch_cls
+        finalized=[]
+        for p, yb, ym_name, ybr, _ybcls in self.samples:
             if yb == 1:
-                ybcls = self.branch_class_to_idx[br][f"real_{br}"]
-                self.samples.append((p, 1, -1, ybr, ybcls))
+                ybcls = self.branch_class_to_idx['face']["real_face"]
+                finalized.append((p, 1, -1, ybr, ybcls))
             else:
                 ym = self.method_to_idx[str(ym_name)]
-                ybcls = self.branch_class_to_idx[br][str(ym_name)]
-                self.samples.append((p, 0, ym, ybr, ybcls))
+                ybcls = self.branch_class_to_idx['face'][str(ym_name)]
+                finalized.append((p, 0, ym, ybr, ybcls))
+        self.samples = sorted(finalized, key=lambda t: natural_key(t[0]))
 
-        self.samples.sort(key=lambda t: natural_key(t[0]))
-
-        # thống kê
-        self.per_class = {f"real_{br}":0 for br in ["face","head","full"]}
+        # stats
+        self.per_class = {"real_face":0}
         for m in self.method_names: self.per_class[m]=0
-        for _, yb, ym, ybr, _ in self.samples:
-            if yb==1: self.per_class[f"real_{ID2BRANCH[ybr]}"] += 1
+        for _, yb, ym, ybr, ybcls in self.samples:
+            if yb==1: self.per_class["real_face"] += 1
             else:     self.per_class[self.method_names[ym]] += 1
 
     def __len__(self): return len(self.samples)
@@ -147,9 +153,10 @@ class MultiHeadViT(nn.Module):
                                  nn.Linear(feat, n))
         self.head_bin  = head(2)
         self.head_met  = head(num_methods)
-        self.head_face = head(num_face_classes)
-        self.head_head = head(num_head_classes)
-        self.head_full = head(num_full_classes)
+        # face head is used; head/full kept for API compatibility (will be unused if empty)
+        self.head_face = head(max(1, num_face_classes))
+        self.head_head = head(max(1, num_head_classes))
+        self.head_full = head(max(1, num_full_classes))
 
     def forward(self, x):
         f = self.backbone(x)
@@ -159,21 +166,57 @@ class MultiHeadViT(nn.Module):
                  self.head_head(f),
                  self.head_full(f) )
 
-# -------------- EMA --------------
+# -------------- EMA (giống train_gru.py) --------------
 class EMA:
     def __init__(self, model: nn.Module, decay=0.9999):
         self.decay = decay
-        self.shadow = {n:p.data.clone() for n,p in model.named_parameters() if p.requires_grad}
+        # shadow khởi tạo cùng device với tham số model
+        self.shadow = {n: p.data.detach().clone()
+                       for n,p in model.named_parameters() if p.requires_grad}
+
     @torch.no_grad()
     def update(self, model: nn.Module):
         for n,p in model.named_parameters():
-            if p.requires_grad:
-                self.shadow[n] = (1.0-self.decay)*p.data + self.decay*self.shadow[n]
-    @torch.no_grad()
+            if not p.requires_grad:
+                continue
+            if n not in self.shadow:
+                self.shadow[n] = p.data.detach().clone()
+            else:
+                # shadow = decay*shadow + (1-decay)*param
+                self.shadow[n].mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
     def apply_to(self, model: nn.Module):
+        # Backup weights gốc của model về CPU để khôi phục sau
+        self._backup_cpu = {}
         for n,p in model.named_parameters():
-            if p.requires_grad:
-                p.data.copy_(self.shadow[n])
+            if not p.requires_grad:
+                continue
+            self._backup_cpu[n] = p.data.detach().cpu()
+            # copy shadow (dù shadow đang ở CPU hay GPU) sang đúng device của param
+            p.data.copy_(self.shadow[n].to(p.device, non_blocking=True))
+
+    def restore(self, model: nn.Module):
+        # Khôi phục lại weights gốc của model sau khi eval xong
+        if not hasattr(self, "_backup_cpu"):
+            return
+        for n,p in model.named_parameters():
+            if n in self._backup_cpu:
+                p.data.copy_(self._backup_cpu[n].to(p.device, non_blocking=True))
+        del self._backup_cpu
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def offload_shadow_to_cpu(self):
+        # Dời toàn bộ shadow về RAM để giải phóng VRAM (dùng trước khi eval nếu --val_use_ema)
+        for n in list(self.shadow.keys()):
+            self.shadow[n] = self.shadow[n].cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def reload_shadow_to_gpu(self, device):
+        # Nạp shadow trở lại GPU sau khi eval
+        for n in list(self.shadow.keys()):
+            self.shadow[n] = self.shadow[n].to(device, non_blocking=True)
 
 # -------------- loss helpers --------------
 def focal_ce(logits, targets, weight=None, gamma=0.0, label_smoothing=0.0):
@@ -221,12 +264,11 @@ def apply_mix(x, y, mixup_alpha, cutmix_alpha, prob):
 def evaluate(model, loader, device, method_names: List[str],
              thr_min, thr_max, thr_steps,
              method_loss_weight=0.2, label_smoothing=0.0,
-             use_ema=False, ema_obj=None, val_tta="none",
+             use_ema=False, ema_obj=None, val_tta="none", val_repeat=1,
              cons_bacc_min=0.90, cons_rec_real_min=0.90,
-             phase_name="VAL"):  # <— thêm
-    backup=None
-    if use_ema and ema_obj is not None and len(ema_obj.shadow)>0:
-        backup={k:v.detach().cpu() for k,v in model.state_dict().items()}
+             phase_name="VAL"):
+    # Áp EMA như train_gru.py (không dùng backup state_dict nặng VRAM)
+    if use_ema and ema_obj is not None:
         ema_obj.apply_to(model)
 
     model.eval()
@@ -247,46 +289,64 @@ def evaluate(model, loader, device, method_names: List[str],
     per_m_correct={m:0 for m in method_names}
     per_m_total  ={m:0 for m in method_names}
     
-    for x,yb,ym,ybr,_ in tqdm(loader, desc=f'[{phase_name}]', dynamic_ncols=True):  # <— dùng nhãn
-        x=x.to(device); yb=yb.to(device); ym=ym.to(device); ybr=ybr.to(device)
+    for r in range(val_repeat):
+        for x, yb, ym, ybr, _ in tqdm(loader, desc=f'[{phase_name} r{r+1}]', dynamic_ncols=True):
+            x = x.to(device); yb = yb.to(device); ym = ym.to(device); ybr = ybr.to(device)
 
-        if val_tta=="hflip":
-            x2=torch.flip(x,[-1])
-            lb1,lm1,_,_,_=model(x); lb2,lm2,_,_,_=model(x2)
-            lb=(lb1+lb2)*0.5; lm=(lm1+lm2)*0.5
-        else:
-            lb,lm,_,_,_=model(x)
+            # ---- TTA ----
+            if val_tta == "hflip":
+                x2 = torch.flip(x, [-1])
+                lb1, lm1, _, _, _ = model(x)
+                lb2, lm2, _, _, _ = model(x2)
+                lb = (lb1 + lb2) * 0.5
+                lm = (lm1 + lm2) * 0.5
+            elif val_tta == "scale":
+                scales = [0.9, 1.0, 1.1]
+                outs_b, outs_m = [], []
+                for s in scales:
+                    hs = int(x.shape[2] * s)
+                    ws = int(x.shape[3] * s)
+                    xs = F.interpolate(x, size=(hs, ws), mode='bilinear', align_corners=False)
+                    if xs.shape[-1] != 384 or xs.shape[-2] != 384:
+                        xs = F.interpolate(xs, size=(384, 384), mode='bilinear', align_corners=False)
+                    lb_s, lm_s, _, _, _ = model(xs)
+                    outs_b.append(lb_s); outs_m.append(lm_s)
+                lb = sum(outs_b) / len(outs_b)
+                lm = sum(outs_m) / len(outs_m)
+            else:
+                lb, lm, _, _, _ = model(x)
 
-        mask_fake=(yb==0) & (ym>=0)
-        if mask_fake.any():
-            pred_m=lm[mask_fake].argmax(1)
-            mt=ym[mask_fake]
-            method_correct += int((pred_m==mt).sum().item())
-            method_total   += int(mask_fake.sum().item())
-            for i in range(mt.numel()):
-                t=int(mt[i]); p=int(pred_m[i])
-                per_m_total[method_names[t]] += 1
-                if p==t: per_m_correct[method_names[t]] += 1
+            # ---- cập nhật metrics ----
+            mask_fake = (yb==0) & (ym>=0)
+            if mask_fake.any():
+                pred_m = lm[mask_fake].argmax(1)
+                mt = ym[mask_fake]
+                method_correct += int((pred_m==mt).sum().item())
+                method_total   += int(mask_fake.sum().item())
+                for i in range(mt.numel()):
+                    t = int(mt[i]); p = int(pred_m[i])
+                    per_m_total[method_names[t]] += 1
+                    if p == t: per_m_correct[method_names[t]] += 1
 
-        p_fake=torch.softmax(lb.float(),dim=1)[:,0]
-        comp=(p_fake.unsqueeze(1) >= thrs.unsqueeze(0))
-        pred_bin=torch.where(comp, torch.zeros_like(yb).unsqueeze(1),
-                             torch.ones_like(yb).unsqueeze(1))
-        yexp=yb.unsqueeze(1).expand_as(pred_bin)
-        is_fake=(yexp==0); is_real=(yexp==1)
-        correct_fake += (pred_bin==0).logical_and(is_fake).sum(0).to(torch.float64)
-        correct_real += (pred_bin==1).logical_and(is_real).sum(0).to(torch.float64)
-        tot_fake += int((yb==0).sum().item()); tot_real += int((yb==1).sum().item())
+            p_fake = torch.softmax(lb.float(), dim=1)[:,0]
+            comp = (p_fake.unsqueeze(1) >= thrs.unsqueeze(0))
+            pred_bin = torch.where(comp, torch.zeros_like(yb).unsqueeze(1),
+                                   torch.ones_like(yb).unsqueeze(1))
+            yexp = yb.unsqueeze(1).expand_as(pred_bin)
+            is_fake = (yexp==0); is_real = (yexp==1)
+            correct_fake += (pred_bin==0).logical_and(is_fake).sum(0).to(torch.float64)
+            correct_real += (pred_bin==1).logical_and(is_real).sum(0).to(torch.float64)
+            tot_fake += int((yb==0).sum().item()); tot_real += int((yb==1).sum().item())
 
-        for bid in (0,1,2):
-            mask=(ybr==bid)
-            if mask.any():
-                br_tot[bid]+=int(mask.sum().item())
-                pb=p_fake[mask]
-                compb=(pb.unsqueeze(1)>=thrs.unsqueeze(0))
-                predb=torch.where(compb, torch.zeros_like(yb[mask]).unsqueeze(1),
-                                  torch.ones_like(yb[mask]).unsqueeze(1))
-                br_corr[bid]+= (predb==yb[mask].unsqueeze(1)).sum(0).to(torch.float64)
+            for bid in (0,1,2):
+                mask = (ybr==bid)
+                if mask.any():
+                    br_tot[bid] += int(mask.sum().item())
+                    pb = p_fake[mask]
+                    compb = (pb.unsqueeze(1) >= thrs.unsqueeze(0))
+                    predb = torch.where(compb, torch.zeros_like(yb[mask]).unsqueeze(1),
+                                        torch.ones_like(yb[mask]).unsqueeze(1))
+                    br_corr[bid] += (predb==yb[mask].unsqueeze(1)).sum(0).to(torch.float64)
 
     rec_fake=(correct_fake/max(1,tot_fake)).cpu()
     rec_real=(correct_real/max(1,tot_real)).cpu()
@@ -306,11 +366,9 @@ def evaluate(model, loader, device, method_names: List[str],
         "per_method_acc": {m:(per_m_correct[m]/per_m_total[m] if per_m_total[m]>0 else None) for m in method_names}
     }
 
-    # constraint optional
     mask = (bacc>=cons_bacc_min) & (rec_real>=cons_rec_real_min)
     if mask.any():
         idxs=torch.nonzero(mask).squeeze(1)
-        # chọn max recall fake
         best=idxs[torch.argmax(rec_fake[idxs])]
         res.update({
             "cons_thr": float(thrs[best].cpu()),
@@ -320,8 +378,9 @@ def evaluate(model, loader, device, method_names: List[str],
             "cons_rec_real": float(rec_real[best]),
         })
 
-    if backup is not None:
-        model.load_state_dict(backup, strict=False)
+    # Khôi phục weights gốc sau khi eval EMA
+    if use_ema and ema_obj is not None:
+        ema_obj.restore(model)
 
     print(f"[KQ {phase_name}] acc={res['acc']:.4f} | bacc={res['bacc']:.4f} | "
           f"rec_fake={res['rec_fake']:.4f} | rec_real={res['rec_real']:.4f} | "
@@ -341,7 +400,7 @@ def main():
     ap.add_argument("--workers", type=int, default=4)
 
     ap.add_argument("--img_size", type=int, default=512)
-    ap.add_argument("--model", default="vit_base_patch16_384")
+    ap.add_argument("--model", default="vit_base_patch16_384") # chạy file check_timm_support.py để xem các model hỗ trợ của timm
 
     ap.add_argument("--ema", action="store_true")
     ap.add_argument("--val_use_ema", action="store_true")
@@ -378,6 +437,8 @@ def main():
     ap.add_argument("--warmup_steps", type=int, default=800)
     ap.add_argument("--clip_grad", type=float, default=1.0)
     ap.add_argument("--weight_decay", type=float, default=0.05)
+    # NEW: cosine decay (disabled if <= 0)
+    ap.add_argument("--cosine_min_lr", type=float, default=0.0)
 
     # threshold sweep
     ap.add_argument("--thr_min", type=float, default=0.55)
@@ -390,13 +451,17 @@ def main():
     ap.add_argument("--method_warmup_epochs", type=int, default=0)
     ap.add_argument("--early_stop_patience", type=int, default=3)
     ap.add_argument("--grad_ckpt", action="store_true")
-    ap.add_argument("--val_tta", choices=["none","hflip"], default="none")
+    ap.add_argument("--val_tta", choices=["none","hflip","scale"], default="none")
     ap.add_argument("--cons_bacc_min", type=float, default=0.90)
     ap.add_argument("--cons_rec_real_min", type=float, default=0.90)
+    # NEW: during freeze phase, keep last N ViT blocks trainable
+    ap.add_argument("--unfreeze_last_blocks", type=int, default=0)
 
     # eval-only
     ap.add_argument("--eval_only", action="store_true")
     ap.add_argument("--eval_split", choices=["val","test"], default="val")
+    ap.add_argument("--val_repeat", type=int, default=1, help="Số lần lặp lại validation để lấy trung bình (VD: 2 hoặc 3).")
+
     args=ap.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32=True
@@ -425,16 +490,16 @@ def main():
                                   transforms.ToTensor(),
                                   transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
 
-    # datasets
+    # datasets (now face-only loader)
     ds_train=MultiBranchDataset(args.data_root,'train',tfm_train)
     ds_val  =MultiBranchDataset(args.data_root,'val',  tfm_eval)
 
-    has_any_test = any(os.path.isdir(os.path.join(args.data_root, br, 'test')) for br in ['face','head','full'])
+    has_any_test = os.path.isdir(os.path.join(args.data_root, 'face', 'test'))
     ds_test = MultiBranchDataset(args.data_root,'test', tfm_eval) if has_any_test else None
 
     method_names = ds_train.method_names
     print(f"📊 Method union: {method_names}")
-    print(f"📚 Branch classes: { {br: ds_train.branch_classnames[br] for br in ['face','head','full']} }")
+    print(f"📚 Branch classes: {{'face': {ds_train.branch_classnames['face']}, 'head': [], 'full': []}}")
 
     def stat(ds):
         return f"{len(ds)} | " + ", ".join([f"{k}:{v}" for k,v in ds.per_class.items()])
@@ -450,8 +515,7 @@ def main():
         w=[]
         for _, yb, ym, ybr, _ in ds_train.samples:
             if yb==1:
-                tag=f"real_{ID2BRANCH[ybr]}"
-                w.append(boost.get(tag, boost.get("real",1.0)))
+                w.append(boost.get("real",1.0))
             else:
                 w.append(boost.get(method_names[int(ym)], 1.0))
         sampler=WeightedRandomSampler(w, num_samples=len(w), replacement=True)
@@ -496,11 +560,37 @@ def main():
     scaler=torch.amp.GradScaler('cuda', enabled=(device.type=='cuda'))
     ema = EMA(model, 0.9999) if args.ema else None
 
-    # freeze backbone đầu
+    # ---- FREEZE helpers (support --unfreeze_last_blocks) ----
+    def _set_requires_grad(module: nn.Module, req: bool):
+        for p in module.parameters():
+            p.requires_grad = req
+
     def set_backbone_grad(req: bool):
-        for p in model.backbone.parameters(): p.requires_grad=req
+        """
+        If req=True: unfreeze ALL backbone params.
+        If req=False: freeze backbone, except keep last N transformer blocks (and final norm) trainable
+        when args.unfreeze_last_blocks > 0.
+        """
+        if req:
+            _set_requires_grad(model.backbone, True)
+            return
+        # freeze all first
+        _set_requires_grad(model.backbone, False)
+        n_keep = max(0, int(args.unfreeze_last_blocks))
+        if n_keep <= 0:
+            return
+        # try to unfreeze last N blocks of ViT
+        blocks = getattr(model.backbone, "blocks", None)
+        if isinstance(blocks, (list, nn.ModuleList)):
+            for b in list(blocks)[-n_keep:]:
+                _set_requires_grad(b, True)
+        # unfreeze final norm if present
+        if hasattr(model.backbone, "norm"):
+            _set_requires_grad(model.backbone.norm, True)
+
+    # freeze backbone đầu
     if args.freeze_epochs>0:
-        print(f"🧊 Freeze backbone {args.freeze_epochs} epoch đầu")
+        print(f"🧊 Freeze backbone {args.freeze_epochs} epoch đầu (giữ mở {args.unfreeze_last_blocks} block cuối)")
         set_backbone_grad(False)
 
     start_epoch=1; best_metric=-1.0; epochs_no_improve=0
@@ -522,19 +612,28 @@ def main():
     # lưu label map cho inference
     with open(os.path.join(args.out_dir,"label_map.json"),"w",encoding="utf-8") as f:
         json.dump({"method_names": method_names,
-                   "branch_classes": ds_train.branch_classnames}, f, ensure_ascii=False, indent=2)
+                   "branch_classes": {'face': ds_train.branch_classnames['face'], 'head': [], 'full': []}},
+                  f, ensure_ascii=False, indent=2)
 
     # eval-only
     if args.eval_only:
         loader = dl_val if args.eval_split=="val" else dl_test
         if loader is None: raise RuntimeError(f"Không có dữ liệu cho split '{args.eval_split}'.")
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        if ema is not None and args.val_use_ema: ema.offload_shadow_to_cpu()
+
         evaluate(model, loader, device, method_names,
                  args.thr_min, args.thr_max, args.thr_steps,
                  method_loss_weight=args.method_loss_weight,
                  label_smoothing=args.label_smoothing,
                  use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
-                 val_tta=args.val_tta,
-                 cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min)
+                 val_tta=args.val_tta, val_repeat=args.val_repeat,
+                 cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min,
+                 phase_name=args.eval_split.upper())
+
+        if ema is not None and args.val_use_ema: ema.reload_shadow_to_gpu(device)
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
         return
 
     # losses
@@ -544,13 +643,25 @@ def main():
     def ce_met(logits, targets):
         return F.cross_entropy(logits, targets, label_smoothing=args.label_smoothing)
 
-    # lr schedule
+    # ---- LR schedule (warmup → cosine if enabled) ----
     global_step=0
+    # compute effective optimizer steps per epoch (after grad accumulation)
+    steps_per_epoch = max(1, len(dl_train) // max(1, args.batch_size//args.micro_batch))
+    total_steps = steps_per_epoch * args.epochs
+    cosine_steps = max(1, total_steps - max(0, args.warmup_steps))
+
     def set_lr(step):
+        # warmup
         if args.warmup_steps>0 and step<args.warmup_steps:
             lr=args.lr*float(step+1)/float(args.warmup_steps)
         else:
-            lr=args.lr
+            if args.cosine_min_lr and args.cosine_min_lr>0.0:
+                # cosine decay from lr -> cosine_min_lr over cosine_steps
+                s = min(step - args.warmup_steps, cosine_steps)
+                cos_t = 0.5*(1+math.cos(math.pi*float(s)/float(cosine_steps)))
+                lr = args.cosine_min_lr + (args.lr - args.cosine_min_lr)*cos_t
+            else:
+                lr=args.lr
         for pg in opt.param_groups: pg['lr']=lr
         return lr
 
@@ -624,7 +735,7 @@ def main():
                 if mask_fake.any() and eff_w_met>0:
                     loss_m = ce_met(lm[mask_fake].float(), ym[mask_fake])
 
-                # branch CE đa lớp
+                # branch CE (only face has classes; head/full empty)
                 loss_face=torch.tensor(0.0, device=device)
                 loss_head=torch.tensor(0.0, device=device)
                 loss_full=torch.tensor(0.0, device=device)
@@ -633,6 +744,8 @@ def main():
                 if m_face.any():
                     loss_face = F.cross_entropy(lfa[m_face].float(), ybcls[m_face],
                                                 label_smoothing=args.label_smoothing)
+
+                # no samples for head/full -> these masks will be empty
                 m_head=(ybr==BRANCH2ID['head'])
                 if m_head.any():
                     loss_head = F.cross_entropy(lhe[m_head].float(), ybcls[m_head],
@@ -685,7 +798,7 @@ def main():
                 acc=(pred==yb).float().mean().item()
                 pbar.set_postfix_str(f"loss={loss.item():.4f} acc~={acc:.4f} lr={opt.param_groups[0]['lr']:.2e}")
 
-        # ----- TRAIN summary (nhị phân + branch bin + method acc) -----
+        # ----- TRAIN summary -----
         with torch.no_grad():
             lb_tr=torch.cat(logits_b_list,0); yb_tr=torch.cat(labels_b_list,0)
             thrs_tr=torch.linspace(args.thr_min,args.thr_max,steps=101)
@@ -719,13 +832,17 @@ def main():
         print(f"[KQ TRAIN] acc={best_acc:.4f} | bacc={best_bacc:.4f} | rec_fake={rf:.4f} | rec_real={rr:.4f} | thr*={best_thr:.3f} | m_acc(fake)={macc}")
 
         # ----- VAL -----
+        gc.collect()
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        if ema is not None and args.val_use_ema: ema.offload_shadow_to_cpu()
+
         val_res = evaluate(
             model, dl_val, device, method_names,
             args.thr_min, args.thr_max, args.thr_steps,
             method_loss_weight=args.method_loss_weight,
             label_smoothing=args.label_smoothing,
             use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
-            val_tta=args.val_tta,
+            val_tta=args.val_tta, val_repeat=args.val_repeat,
             cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min
             , phase_name="VAL"
         )
@@ -740,10 +857,14 @@ def main():
                 method_loss_weight=args.method_loss_weight,
                 label_smoothing=args.label_smoothing,
                 use_ema=(args.val_use_ema and ema is not None), ema_obj=ema,
-                val_tta=args.val_tta,
+                val_tta=args.val_tta, val_repeat=args.val_repeat,
                 cons_bacc_min=args.cons_bacc_min, cons_rec_real_min=args.cons_rec_real_min
                 , phase_name="TEST"
             )
+
+        # Sau khi xong tất cả eval → nạp EMA trở lại GPU để train tiếp
+        if ema is not None and args.val_use_ema: ema.reload_shadow_to_gpu(device)
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
 
         # ----- LOGGING (CSV + JSONL) -----
         row = {
@@ -792,25 +913,58 @@ def main():
             f.write(json.dumps(row, ensure_ascii=False)+"\n")
 
         # ----- SAVE -----
+        base_meta = {
+            "model_name": args.model,
+            "img_size": args.img_size,
+            "method_names": method_names,            # giữ nguyên cho FE đọc
+        }
+
         improved = val_res['bacc'] > best_metric
         if improved:
-            best_metric = val_res['bacc']; epochs_no_improve=0
-            best_path=os.path.join(args.out_dir,"detector_best.pt")
-            torch.save({'model':model.state_dict(),'optimizer':opt.state_dict(),
-                        'scaler':scaler.state_dict(),'ema':(ema.shadow if ema else None),
-                        'epoch':epoch,'best_metric':best_metric,
-                        'best_thr':val_res.get('best_thr',None)}, best_path)
-            print(f"💾 Lưu BEST → {best_path} (thr*={val_res.get('best_thr',None)})")
+            best_metric = val_res['bacc']; epochs_no_improve = 0
+            meta_best = dict(base_meta)
+            meta_best.update({
+                "threshold": val_res.get("best_thr", None),
+                "branch_thresholds": None,
+                "threshold_constrained": val_res.get("cons_thr", None),
+                "branch_thresholds_constrained": None,
+            })
+            best_path = os.path.join(args.out_dir, "detector_best.pt")
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "scaler": scaler.state_dict(),
+                "ema": (ema.shadow if ema else None),
+                "epoch": epoch,
+                "best_metric": best_metric,
+                "best_thr": val_res.get("best_thr", None),
+                "meta": meta_best,
+            }, best_path)
+            print(f"💾 Lưu BEST → {best_path} (thr*={val_res.get('best_thr', None)})")
         else:
-            epochs_no_improve+=1
+            epochs_no_improve += 1
 
-        ep_path=os.path.join(args.out_dir, f"detector_epoch{epoch}.pt")
-        torch.save({'model':model.state_dict(),'optimizer':opt.state_dict(),
-                    'scaler':scaler.state_dict(),'ema':(ema.shadow if ema else None),
-                    'epoch':epoch,'best_metric':best_metric,
-                    'val_summary':val_res,'test_summary':test_res}, ep_path)
+        meta_ep = dict(base_meta)
+        meta_ep.update({
+            "threshold": val_res.get("best_thr", None),
+            "branch_thresholds": None,
+            "threshold_constrained": val_res.get("cons_thr", None),
+            "branch_thresholds_constrained": None,
+        })
+        ep_path = os.path.join(args.out_dir, f"detector_epoch{epoch}.pt")
+        torch.save({
+                "model": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "scaler": scaler.state_dict(),
+                "ema": (ema.shadow if ema else None),
+                "epoch": epoch,
+                "best_metric": best_metric,
+                "val_summary": val_res,
+                "test_summary": test_res,
+                "meta": meta_ep,
+        }, ep_path)
 
-        if args.early_stop_patience>0 and epochs_no_improve>=args.early_stop_patience:
+        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
             print(f"🛑 Early stopping sau {args.early_stop_patience} epoch không cải thiện BACC.")
             break
 

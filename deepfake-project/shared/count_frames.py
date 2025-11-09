@@ -1,165 +1,119 @@
-# count_frames.py
-# Đếm số frame cho cấu trúc processed_multi mới:
-# processed_multi/<branch>/<split>/
-#   - real_<branch>/ <video-id>/*.jpg
-#   - fake_<branch>/<Method>/<video-id>/*.jpg
+# count_frames.py — for processed_multi/face/{train,val,test}/{real/<dataset>/, fake/<method>/}<video_id>/*
+# Counts frames per split; lists per-dataset (real) and per-method (fake).
+# Usage:
+#   python count_frames.py --data_root H:\...\processed_multi
 
-import os
+from __future__ import annotations
 import argparse
-from collections import defaultdict
+from pathlib import Path
 
-# Mặc định trỏ tới processed_multi; có thể đổi bằng --data_root
-DEFAULT_DATA_ROOT = r"H:\deepfake-project\deepfake-project\data\processed_multi"
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# Các đuôi ảnh phổ biến
-EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+def is_image(p: Path) -> bool:
+    return p.is_file() and p.suffix.lower() in IMG_EXTS
 
-BRANCHES = ["face", "head", "full"]
-SPLITS = ["train", "val", "test"]
-
-
-def count_in_dir(path: str) -> int:
+def count_images_one_level(dir_path: Path) -> int:
+    """Count images directly under each subdir (assumes dir_path/<video_id>/*.jpg)."""
+    if not dir_path.exists():
+        return 0
     total = 0
-    for root, _, files in os.walk(path):
-        for f in files:
-            if os.path.splitext(f)[1].lower() in EXTS:
-                total += 1
+    for vid_dir in dir_path.iterdir():
+        if vid_dir.is_dir():
+            total += sum(1 for f in vid_dir.iterdir() if is_image(f))
     return total
 
-
-def scan_split_branch(data_root: str, branch: str, split: str):
+def count_real_datasets(real_root: Path) -> dict[str, int]:
     """
-    Trả về:
-      real_count: int
-      per_method: dict[method] = int
-      fake_total: int
-      split_total: int (real + fake_total)
+    Real layout: .../face/<split>/real/<DatasetName>/<video_id>/*.jpg
+    Also supports flat layout: .../face/<split>/real/<video_id>/*.jpg
     """
-    split_dir = os.path.join(data_root, branch, split)
-    real_dir = os.path.join(split_dir, f"real_{branch}")
-    fake_parent = os.path.join(split_dir, f"fake_{branch}")
+    result: dict[str, int] = {}
+    if not real_root.exists():
+        return result
 
-    real_count = count_in_dir(real_dir) if os.path.isdir(real_dir) else 0
+    subdirs = [d for d in real_root.iterdir() if d.is_dir()]
+    # có thư mục tên dataset “chuẩn”?
+    has_named = any((real_root / name).exists() for name in ["Faceforensics", "Celeb-DF-v2", "Tiktok-DF"])
 
-    per_method = {}
-    fake_total = 0
-    if os.path.isdir(fake_parent):
-        for m in sorted(d for d in os.listdir(fake_parent) if os.path.isdir(os.path.join(fake_parent, d))):
-            c = count_in_dir(os.path.join(fake_parent, m))
-            per_method[m] = c
-            fake_total += c
+    if has_named or subdirs:
+        # Case A: có các thư mục con → coi như dạng real/<DatasetName>/
+        for d in sorted(subdirs):
+            cnt = count_images_one_level(d)
+            if cnt > 0:
+                result[d.name] = cnt
+    else:
+        # Case B: flat real/<video_id>/*.jpg
+        flat = count_images_one_level(real_root)
+        if flat > 0:
+            result["__flat__"] = flat
 
-    split_total = real_count + fake_total
-    return real_count, per_method, fake_total, split_total
+    return result
 
+def count_fake_methods(fake_root: Path) -> dict[str, int]:
+    """Fake layout: .../face/<split>/fake/<Method>/<video_id>/*.jpg"""
+    out: dict[str, int] = {}
+    if not fake_root.exists():
+        return out
+    for mdir in sorted([p for p in fake_root.iterdir() if p.is_dir()]):
+        total = count_images_one_level(mdir)
+        if total > 0:
+            out[mdir.name] = total
+    return out
+
+def pretty_int(n: int) -> str:
+    return f"{n:,}".replace(",", "_")
 
 def main():
-    ap = argparse.ArgumentParser("Đếm frame trong processed_multi (branch/split/real-fake-method)")
-    ap.add_argument("--data_root", type=str, default=DEFAULT_DATA_ROOT, help="Thư mục processed_multi")
-    ap.add_argument("--csv", type=str, default=None, help="Đường dẫn CSV xuất báo cáo. Nếu bỏ trống sẽ lưu vào ../reports/frame_summary.csv")
-    ap.add_argument("--show_empty", action="store_true", help="Hiển thị cả các mục 0 frame")
+    ap = argparse.ArgumentParser(description="Count frames in processed_multi/face structure")
+    ap.add_argument("--data_root", required=True,
+                    help="Path to processed_multi directory (contains 'face/' subdir)")
     args = ap.parse_args()
 
-    data_root = args.data_root
+    proc = Path(args.data_root)
+    face_root = proc / "face"
+    if not face_root.exists():
+        raise SystemExit(f"[ERR] Not found: {face_root}")
 
-    # Cấu trúc lưu kết quả
-    # counts[split][branch]['real'] = int
-    # counts[split][branch]['fake_total'] = int
-    # counts[split][branch]['methods'][method] = int
-    counts = defaultdict(lambda: defaultdict(lambda: {"real": 0, "fake_total": 0, "methods": defaultdict(int)}))
-    totals_per_split = defaultdict(int)
-    totals_per_branch = defaultdict(int)  # cộng gộp qua tất cả split
+    splits = ["train", "val", "test"]
+    grand_total = 0
 
-    # Duyệt
-    for split in SPLITS:
-        for branch in BRANCHES:
-            if not os.path.isdir(os.path.join(data_root, branch, split)):
-                continue
-            real_c, per_m, fake_c, split_tot = scan_split_branch(data_root, branch, split)
-            counts[split][branch]["real"] = real_c
-            counts[split][branch]["fake_total"] = fake_c
-            for m, c in per_m.items():
-                counts[split][branch]["methods"][m] += c
+    print(f"📊 Frame counts per branch/split (root={face_root})\n")
 
-            totals_per_split[split] += split_tot
-            totals_per_branch[branch] += split_tot
+    for sp in splits:
+        split_dir = face_root / sp
+        if not split_dir.exists():
+            print(f"[{sp.upper()}] (missing)")
+            continue
 
-    # In bảng gọn
-    print("📊 Frame counts per branch/split (processed_multi):\n")
-    for split in SPLITS:
-        split_total = totals_per_split.get(split, 0)
-        print(f"[{split.upper()}] total: {split_total:,}")
-        for branch in BRANCHES:
-            if branch not in counts[split]:
-                if args.show_empty:
-                    print(f"  {branch:<5} | real: 0 | fake_total: 0")
-                continue
-            real_c  = counts[split][branch]["real"]
-            fake_c  = counts[split][branch]["fake_total"]
-            print(f"  {branch:<5} | real: {real_c:,} | fake_total: {fake_c:,} | sum: {real_c + fake_c:,}")
+        real_dir = split_dir / "real"
+        fake_dir = split_dir / "fake"
 
-            # liệt kê từng method
-            methods = counts[split][branch]["methods"]
-            if methods:
-                for m in sorted(methods.keys()):
-                    v = methods[m]
-                    if v > 0 or args.show_empty:
-                        print(f"     └─ {m:<16}: {v:,}")
+        real_by_ds = count_real_datasets(real_dir)     # dict dataset -> frames
+        fake_by_m  = count_fake_methods(fake_dir)      # dict method  -> frames
+
+        real_total = sum(real_by_ds.values())
+        fake_total = sum(fake_by_m.values())
+        split_total = real_total + fake_total
+        grand_total += split_total
+
+        print(f"[{sp.upper()}] total: {pretty_int(split_total)}")
+        print(f"  face  | real: {pretty_int(real_total)} | fake_total: {pretty_int(fake_total)} | sum: {pretty_int(split_total)}")
+
+        if real_by_ds:
+            for ds in sorted(real_by_ds.keys()):
+                label = ds if ds != "__flat__" else "(real-flat)"
+                print(f"     └─ {label:<15}: {pretty_int(real_by_ds[ds])}")
+        else:
+            print(f"     └─ (no real frames)")
+
+        if fake_by_m:
+            for mname in sorted(fake_by_m.keys()):
+                print(f"     └─ {mname:<15}: {pretty_int(fake_by_m[mname])}")
+        else:
+            print(f"     └─ (no fake frames)")
         print()
 
-    # Tổng theo branch (gộp mọi split)
-    print("📦 Tổng theo branch (gộp train/val/test):")
-    for branch in BRANCHES:
-        print(f"  - {branch:<5}: {totals_per_branch.get(branch, 0):,}")
-    print()
-
-    # Xuất CSV
-    if args.csv:
-        out_csv = args.csv
-    else:
-        # ../reports/frame_summary.csv (so với processed_multi)
-        reports_dir = os.path.normpath(os.path.join(data_root, "..", "reports"))
-        os.makedirs(reports_dir, exist_ok=True)
-        out_csv = os.path.join(reports_dir, "frame_summary.csv")
-
-    import csv
-    with open(out_csv, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["Split", "Branch", "Type", "Name", "Frames"])
-        for split in SPLITS:
-            for branch in BRANCHES:
-                if branch not in counts[split]:
-                    if args.show_empty:
-                        w.writerow([split, branch, "real", f"real_{branch}", 0])
-                        w.writerow([split, branch, "fake_total", "", 0])
-                    continue
-
-                # real
-                w.writerow([split, branch, "real", f"real_{branch}", counts[split][branch]["real"]])
-
-                # fake per method
-                methods = counts[split][branch]["methods"]
-                if methods:
-                    for m, c in methods.items():
-                        w.writerow([split, branch, "fake_method", m, c])
-
-                # fake total
-                w.writerow([split, branch, "fake_total", "", counts[split][branch]["fake_total"]])
-
-                # branch total (split-level)
-                branch_sum = counts[split][branch]["real"] + counts[split][branch]["fake_total"]
-                w.writerow([split, branch, "branch_total", "", branch_sum])
-
-        # split total
-        for split in SPLITS:
-            w.writerow([split, "", "split_total", "", totals_per_split.get(split, 0)])
-
-        # overall totals per branch
-        for branch in BRANCHES:
-            w.writerow(["", branch, "overall_branch_total", "", totals_per_branch.get(branch, 0)])
-
-    print(f"✅ Báo cáo CSV đã lưu: {out_csv}")
-
+    print(f"Σ GRAND TOTAL (all splits): {pretty_int(grand_total)}")
 
 if __name__ == "__main__":
     main()

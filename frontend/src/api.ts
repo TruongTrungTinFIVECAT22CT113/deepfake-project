@@ -1,67 +1,89 @@
-// ---- Types ----
-export type ModelMeta = { id: string; name: string; enabled: boolean };
-
-export type AnalyzeOptions = {
-  face_crop: boolean;
-  auto_thr: boolean;
-  thr: number;
-  tta: number;
-  thickness: number;
-  enable_filters: boolean;
-  method_gate: number;
-  saliency_density: number;
-  duration_sec?: number;
-  enabled_ids_csv?: string; // FE gửi list model đang bật
+export type Health = {
+  status: "ok" | "loading" | "error";
+  methods?: string[];
+  retinaface_available?: boolean;
+  models?: ModelMeta[];
+  threshold_mode?: "single" | "average";
+  threshold_default?: number | null;
 };
 
-// ---- Helpers ----
-const API_BASE = ""; // dùng proxy Vite: '' + '/api/...'
+export type ModelMeta = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  schema?: { method_names?: string[]; img_size?: number };
+  best_thr?: number;
+};
 
-// ---- Calls ----
-export async function getHealth() {
-  const r = await fetch(`/api/health`);
-  if (!r.ok) throw new Error("health failed");
-  return r.json();
+export type AnalyzeOptions = {
+  // Advanced
+  detector_backend?: "retinaface" | "mediapipe";
+  bbox_scale?: number;   // 1.10 default
+  thickness?: number;    // 3 default
+  thr?: number | null;   // override, only effective when exactly 1 model is enabled
+
+  // Basic
+  duration_sec?: number; // optional
+
+  // Models
+  enabled_ids_csv?: string;
+};
+
+const API_BASE = "";
+
+export async function getHealth(): Promise<Health> {
+  try {
+    const r = await fetch(`${API_BASE}/api/health`);
+    if (!r.ok) return { status: "error" };
+    const j = await r.json();
+    return j;
+  } catch {
+    return { status: "error" };
+  }
 }
 
 export async function listModels(): Promise<ModelMeta[]> {
-  const r = await fetch(`/api/models`);
-  if (!r.ok) throw new Error("models failed");
-  return r.json();
+  const r = await fetch(`${API_BASE}/api/models`);
+  if (!r.ok) throw new Error("Failed to list models");
+  return await r.json();
 }
 
 export async function setModelsEnabled(enabled_ids: string[]): Promise<ModelMeta[]> {
-  const r = await fetch(`/api/models/set-enabled`, {
+  const r = await fetch(`${API_BASE}/api/models/set-enabled`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ enabled_ids }),
   });
-  if (!r.ok) throw new Error((await r.json()).error || "set-enabled failed");
-  return r.json();
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
 }
 
-export async function analyzeVideo(file: File, opts: AnalyzeOptions) {
-  const form = new FormData();
-  form.append("file", file);
-  Object.entries(opts).forEach(([k, v]) => {
-    if (v !== undefined && v !== null && !(typeof v === "number" && Number.isNaN(v))) {
-      form.append(k, String(v));
-    }
-  });
+export async function analyzeVideo(
+  file: File,
+  opts: AnalyzeOptions
+): Promise<any> {
+  const fd = new FormData();
+  fd.append("file", file);
 
-  const r = await fetch(`/api/analyze`, { method: "POST", body: form });
-  if (!r.ok) throw new Error((await r.json()).error || "analyze failed");
+  // Advanced
+  fd.append("detector_backend", String(opts.detector_backend ?? "retinaface"));
+  fd.append("bbox_scale", String(opts.bbox_scale ?? 1.10));
+  fd.append("thickness", String(opts.thickness ?? 3));
 
-  // Kết quả backend mới
-  type NewResp = {
-    verdict: string;
-    video_url: string;
-    frames_total?: number;
-    fake_frames?: number;
-    fake_ratio?: number;      // 0..1
-    threshold_used?: number;
-    method_rows: [string, number][];
-    fake_real_bar_html?: string;
-  };
-  return r.json() as Promise<NewResp>;
+  // thr override: only send if number (frontend still sends; BE will ignore if >=2 models)
+  if (typeof opts.thr === "number" && !Number.isNaN(opts.thr)) {
+    fd.append("thr", String(opts.thr));
+  }
+
+  // Basic
+  if (typeof opts.duration_sec === "number") {
+    fd.append("duration_sec", String(opts.duration_sec));
+  }
+
+  // Models
+  if (opts.enabled_ids_csv) fd.append("enabled_ids_csv", opts.enabled_ids_csv);
+
+  const r = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: fd });
+  if (!r.ok) throw new Error(await r.text());
+  return await r.json();
 }

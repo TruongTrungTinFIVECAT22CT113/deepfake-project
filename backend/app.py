@@ -1,41 +1,49 @@
 # -*- coding: utf-8 -*-
+from __future__ import annotations
 import os, tempfile
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
 from fastapi import FastAPI, File, UploadFile, Form, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import cv2
+import torch
 
 from components.model import load_multiple_detectors, discover_checkpoints
 from components.inference import analyze_video
-from components.filters import try_load_filters_json
+from components.face_detection import retinaface_available
+from components.utils import average_threshold
 
-app = FastAPI(title="Deepfake Detect API", version="1.4")
+app = FastAPI(title="Deepfake Detect API (Strict Pipeline)", version="2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-_DETECTORS_INFO: List[Any] = []
+_DETECTORS_INFO: List[dict] = []
 _MODELS_META: List[Dict[str, Any]] = []
 _METHOD_NAMES: List[str] | None = None
-_DET_THR: float = 0.5
-_IMG_SIZE: int = 512
 
-def _clip_first_seconds(src_path: str, seconds: float) -> str | None:
+def _clip_first_seconds(src_path: str, seconds: float) -> Optional[str]:
     try:
         if seconds is None or seconds <= 0:
             return None
         cap = cv2.VideoCapture(src_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 0
-        if fps <= 0: cap.release(); return None
+        if fps <= 0:
+            cap.release()
+            return None
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        if w <= 0 or h <= 0: cap.release(); return None
+        if w <= 0 or h <= 0:
+            cap.release()
+            return None
 
         max_frames = int(seconds * fps + 0.5)
-        if max_frames <= 0: cap.release(); return None
+        if max_frames <= 0:
+            cap.release()
+            return None
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
@@ -44,13 +52,18 @@ def _clip_first_seconds(src_path: str, seconds: float) -> str | None:
         count = 0
         while count < max_frames:
             ok, frame = cap.read()
-            if not ok: break
-            writer.write(frame); count += 1
+            if not ok:
+                break
+            writer.write(frame)
+            count += 1
 
-        writer.release(); cap.release()
+        writer.release()
+        cap.release()
         if count == 0:
-            try: os.remove(out_path)
-            except Exception: pass
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
             return None
         return out_path
     except Exception:
@@ -58,46 +71,52 @@ def _clip_first_seconds(src_path: str, seconds: float) -> str | None:
 
 @app.on_event("startup")
 def _load_models():
-    global _DETECTORS_INFO, _MODELS_META, _METHOD_NAMES, _DET_THR, _IMG_SIZE
+    global _DETECTORS_INFO, _MODELS_META, _METHOD_NAMES
     ckpt_paths = discover_checkpoints()
     if not ckpt_paths:
-        raise RuntimeError("Không tìm thấy checkpoint (*.pt). Đặt ở deepfake_detector/models/** hoặc backend/models/**")
+        raise RuntimeError("Không tìm thấy checkpoint (*.pt). Đặt ở backend/models/** hoặc deepfake_detector/models/**")
 
     _DETECTORS_INFO = load_multiple_detectors(ckpt_paths)
-    _METHOD_NAMES = list(_DETECTORS_INFO[0][4] or [])
-    _IMG_SIZE     = int(_DETECTORS_INFO[0][5])
-    _DET_THR      = float(_DETECTORS_INFO[0][6] or 0.5)
-
-    # load filters.json nếu có
-    try_load_filters_json(os.path.dirname(ckpt_paths[0]))
+    _METHOD_NAMES = list(_DETECTORS_INFO[0]["method_names"] or [])
 
     _MODELS_META = []
-    for i, p in enumerate(ckpt_paths):
+    for i, info in enumerate(_DETECTORS_INFO):
+        p = info["ckpt_path"]
         parent = os.path.basename(os.path.dirname(p))
         grand  = os.path.basename(os.path.dirname(os.path.dirname(p)))
-        name = grand if parent.lower()=="checkpoints" else parent
-        if not name: name = os.path.basename(p)
-        mnames = list(_DETECTORS_INFO[i][4] or [])
+        name = grand if parent.lower()=="checkpoints" else parent or os.path.basename(p)
+        mnames = list(info["method_names"] or [])
         _MODELS_META.append({
-            "id": f"m{i+1}", "path": p, "name": name, "enabled": True,
-            "schema": {"method_names": mnames, "img_size": int(_DETECTORS_INFO[i][5])},
+            "id": f"m{i+1}",
+            "path": p,
+            "name": name,
+            "enabled": True,
+            "schema": {"method_names": mnames, "img_size": int(info["img_size"])},
+            "best_thr": float(info["best_thr"]),
         })
 
 @app.get("/api/health")
 def health():
     if not _DETECTORS_INFO:
         return JSONResponse({"status":"loading"}, status_code=503)
+    thr_mode = "single" if len([m for m in _MODELS_META if m["enabled"]]) == 1 else "average"
+    thr_val = None
+    enabled_idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
+    if enabled_idxs:
+        infos = [_DETECTORS_INFO[i] for i in enabled_idxs]
+        thr_val = float(infos[0]["best_thr"]) if len(infos)==1 else average_threshold(infos)
     return {
         "status":"ok",
         "methods": _METHOD_NAMES,
-        "img_size": _IMG_SIZE,
-        "thr": _DET_THR,
-        "models":[{"id":m["id"],"name":m["name"],"enabled":m["enabled"]} for m in _MODELS_META]
+        "retinaface_available": retinaface_available(),
+        "models":[{"id":m["id"],"name":m["name"],"enabled":m["enabled"],"best_thr":m["best_thr"]} for m in _MODELS_META],
+        "threshold_mode": thr_mode,
+        "threshold_default": thr_val,
     }
 
 @app.get("/api/models")
 def list_models():
-    return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"]} for m in _MODELS_META]
+    return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"], "best_thr": m["best_thr"]} for m in _MODELS_META]
 
 @app.post("/api/models/set-enabled")
 def set_models_enabled(payload: Dict[str, List[str]] = Body(...)):
@@ -108,37 +127,36 @@ def set_models_enabled(payload: Dict[str, List[str]] = Body(...)):
         m["enabled"] = (m["id"] in ids)
     if sum(1 for m in _MODELS_META if m["enabled"]) < 1:
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
-    return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"]} for m in _MODELS_META]
+    return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"], "best_thr": m["best_thr"]} for m in _MODELS_META]
 
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
-    face_crop: bool = Form(True),
-    auto_thr: bool = Form(True),
-    thr: float = Form(0.5),
-    tta: int = Form(2),
+    # Advanced only (FE): detector + bbox_scale + optional thr override
+    detector_backend: str = Form("retinaface"),   # "retinaface" | "mediapipe"
+    bbox_scale: float = Form(1.10),
+    thr: float | None = Form(None),               # FE override; ignored if >=2 models
+    # Other
     thickness: int = Form(3),
-    enable_filters: bool = Form(True),
-    method_gate: float = Form(0.55),
-    saliency_density: float = Form(0.02),
-    enabled_ids_csv: str = Form(""),
     duration_sec: float | None = Form(None),
 ):
     if not _DETECTORS_INFO:
         return JSONResponse({"error":"Model chưa sẵn sàng"}, status_code=503)
 
-    # chọn models
-    if enabled_ids_csv.strip():
-        ids = [s.strip() for s in enabled_ids_csv.split(",") if s.strip()]
-        idxs = [i for i,m in enumerate(_MODELS_META) if m["id"] in ids]
-        if not idxs:
-            idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
-    else:
-        idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
-    if not idxs:
+    # choose enabled models
+    enabled_idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
+    if not enabled_idxs:
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
+    chosen = [_DETECTORS_INFO[i] for i in enabled_idxs]
 
-    chosen = [_DETECTORS_INFO[i] for i in idxs]
+    # select threshold per rule
+    fe_thr = float(thr) if (thr is not None and thr != "") else None
+    if len(chosen) == 1:
+        thr_used = float(fe_thr) if (fe_thr is not None) else float(chosen[0]["best_thr"])
+        thr_override_ignored = False
+    else:
+        thr_used = float(sum(ci["best_thr"] for ci in chosen) / len(chosen))
+        thr_override_ignored = True
 
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
@@ -151,17 +169,15 @@ async def analyze(
             clip_path = _clip_first_seconds(src_path, float(duration_sec))
         use_path = clip_path or src_path
 
-        override_thr = None if auto_thr else float(thr)
-        out_path, verdict, bar_html, method_rows, stats = analyze_video(
-            use_path, chosen, _METHOD_NAMES or [], _DET_THR,
-            use_face_crop=bool(face_crop),
-            override_thr=override_thr,
-            tta=int(tta),
+        out_path, verdict, stats, method_rows = analyze_video(
+            use_path,
+            chosen,
+            _METHOD_NAMES or [],
+            fe_thr_override=None if thr_override_ignored else fe_thr,
+            detector_backend=detector_backend,
+            bbox_scale=float(bbox_scale),
+            det_thr=0.5,
             box_thickness=int(thickness),
-            method_gate=float(method_gate),
-            enable_filters=bool(enable_filters),
-            saliency_density=float(saliency_density),
-            saliency_mode="method",
         )
 
         if not out_path:
@@ -171,30 +187,35 @@ async def analyze(
         fname = "result.mp4"
         final_path = os.path.join(os.path.dirname(out_path), fname)
         if out_path != final_path:
-            try: os.replace(out_path, final_path)
-            except Exception: pass
+            try:
+                os.replace(out_path, final_path)
+            except Exception:
+                pass
 
-        # trả về tất cả field FE cần
         return {
             "verdict": verdict,
-            "fake_real_bar_html": bar_html,
-            "method_rows": method_rows,
             "video_url": f"/api/download/{token}/{fname}",
-            # --- số liệu chi tiết FE cần để hiển thị (khung dưới) ---
             "frames_total": stats.get("frames_total", 0),
             "fake_frames": stats.get("fake_frames", 0),
             "fake_ratio": stats.get("fake_ratio", 0.0),
             "fps": stats.get("fps", 0.0),
             "duration_sec": stats.get("duration_sec", 0.0),
-            "threshold_used": stats.get("threshold_used", 0.5),
+            "threshold_used": float(thr_used),
+            "thr_override_ignored": thr_override_ignored,
+            "detector_backend_used": stats.get("detector_backend_used"),
+            "method_rows": method_rows,
             "method_distribution": stats.get("method_distribution", {}),
         }
     finally:
-        try: os.remove(src_path)
-        except Exception: pass
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
         if clip_path:
-            try: os.remove(clip_path)
-            except Exception: pass
+            try:
+                os.remove(clip_path)
+            except Exception:
+                pass
 
 @app.get("/api/download/{token}/{filename}")
 def download(token: str, filename: str):
@@ -202,7 +223,8 @@ def download(token: str, filename: str):
     target_dir = None
     for d in os.listdir(tmp_root):
         if d.startswith("df_web_") and token in d:
-            target_dir = os.path.join(tmp_root, d); break
+            target_dir = os.path.join(tmp_root, d)
+            break
     if not target_dir:
         return JSONResponse({"error":"Không tìm thấy file."}, status_code=404)
     path = os.path.join(target_dir, filename)
