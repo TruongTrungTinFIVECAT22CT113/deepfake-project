@@ -21,10 +21,9 @@ export type AnalyzeOptions = {
   bbox_scale?: number;   // 1.10 default
   thickness?: number;    // 3 default
   thr?: number | null;   // override, only effective when exactly 1 model is enabled
-
   // Basic
-  duration_sec?: number; // optional
-
+  start_sec?: number;        // NEW
+  end_sec?: number;          // NEW
   // Models
   enabled_ids_csv?: string;
 };
@@ -76,9 +75,8 @@ export async function analyzeVideo(
   }
 
   // Basic
-  if (typeof opts.duration_sec === "number") {
-    fd.append("duration_sec", String(opts.duration_sec));
-  }
+  if (opts.start_sec != null) fd.append("start_sec", String(opts.start_sec));
+  if (opts.end_sec != null)   fd.append("end_sec", String(opts.end_sec));
 
   // Models
   if (opts.enabled_ids_csv) fd.append("enabled_ids_csv", opts.enabled_ids_csv);

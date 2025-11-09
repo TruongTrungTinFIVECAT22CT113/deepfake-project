@@ -19,8 +19,9 @@ export default function AnalyzerForm({
   const [dragOver, setDragOver] = useState(false);
   const [fileInfo, setFileInfo] = useState<{ name: string; size: string; duration?: number } | null>(null);
 
-  // Basic
-  const [duration, setDuration] = useState<string>("");
+  // Basic – thay Duration bằng Start/End (giây)
+  const [startTime, setStartTime] = useState<string>(""); // giây, rỗng = từ đầu
+  const [endTime, setEndTime] = useState<string>("");     // giây, rỗng = tới hết
 
   // Advanced
   const [detectorBackend, setDetectorBackend] = useState<"retinaface" | "mediapipe">("retinaface");
@@ -60,37 +61,62 @@ export default function AnalyzerForm({
     return () => input.removeEventListener("change", onChange);
   }, []);
 
+  function parseSec(s: string): number | undefined {
+    const t = s.trim();
+    if (t === "") return undefined;
+    const v = Number(t);
+    return Number.isFinite(v) && v >= 0 ? v : (NaN as any);
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const f = picked || fileRef.current?.files?.[0];
     if (!f) { addToast("Please choose a video file", "error"); return; }
 
-    // duration parse
-    const dur = duration.trim() === "" ? undefined : Number(duration);
-    if (dur !== undefined && (isNaN(dur) || dur < 0)) {
-      addToast("Duration must be >= 0 seconds or empty", "error");
-      return;
-    }
+// parse & validate start/end
+const startRaw = parseSec(startTime);
+const endRaw = parseSec(endTime);
 
-    // thr override parse (only allow when single model enabled)
-    let thr: number | null = null;
-    if (!isMultiModel && thrOverride.trim() !== "") {
-      const t = Number(thrOverride.trim());
-      if (!Number.isFinite(t) || t < 0 || t > 1) {
-        addToast("Threshold override must be in [0,1]", "error");
-        return;
-      }
-      thr = t;
-    }
+if (startRaw === (NaN as any)) { addToast("Start Time must be ≥ 0 seconds or empty", "error"); return; }
+if (endRaw === (NaN as any)) { addToast("End Time must be ≥ 0 seconds or empty", "error"); return; }
 
-    const opts: AnalyzeOptions = {
-      detector_backend: detectorBackend,
-      bbox_scale: bboxScale,
-      thickness: thickness,
-      duration_sec: dur,
-      enabled_ids_csv: enabledIds && enabledIds.length ? enabledIds.join(",") : undefined,
-      thr: thr ?? undefined, // BE will ignore if multiple models
-    };
+// Chuẩn hoá theo duration (nếu có metadata)
+let sVal: number | undefined = startRaw as number | undefined;
+let eVal: number | undefined = endRaw as number | undefined;
+
+const D = (fileInfo?.duration && Number.isFinite(fileInfo.duration)) ? fileInfo.duration! : undefined;
+
+// Nếu biết D: xử lý các case vượt D
+if (D !== undefined) {
+  const startOut = (sVal !== undefined && sVal >= D - 1e-9);
+  const endOut   = (eVal !== undefined && eVal >= D - 1e-9);
+
+  // Nếu cả hai phía đều ngoài biên (hoặc một phía ngoài biên và phía kia rỗng) => xem như full video
+  if ((startOut && (eVal === undefined || endOut)) || (endOut && (sVal === undefined || startOut))) {
+    sVal = undefined;
+    eVal = undefined;
+  } else {
+    // Chuẩn hoá riêng lẻ: phần nào vượt D thì bỏ (coi như không nhập)
+    if (startOut) sVal = undefined;
+    if (endOut)   eVal = undefined;
+  }
+}
+
+// Case còn lại: nếu Start/End đều hợp lệ nội biên và End <= Start -> lỗi
+if (sVal !== undefined && eVal !== undefined && eVal <= sVal) {
+  addToast("End Time must be greater than Start Time", "error");
+  return;
+}
+
+const opts: AnalyzeOptions = {
+  detector_backend: detectorBackend,
+  bbox_scale: bboxScale,
+  thickness,
+  start_sec: sVal,   // có thể undefined
+  end_sec: eVal,     // có thể undefined
+  enabled_ids_csv: enabledIds && enabledIds.length ? enabledIds.join(",") : undefined,
+  thr: (!isMultiModel && thrOverride.trim() !== "") ? Number(thrOverride) : undefined,
+};
 
     setLoading(true);
     try {
@@ -139,17 +165,33 @@ export default function AnalyzerForm({
       <div className="row">
         <div>Basic</div>
         <div className="stack">
-          <div className="row" style={{alignItems:"center"}}>
-            <div>Duration (sec, optional)</div>
+          <div className="row" style={{alignItems:"center", gap: 12}}>
+            <div style={{minWidth: 110}}>Start Time (s)</div>
             <input
               type="number"
               min={0}
               step={0.1}
-              placeholder="Empty = full video"
-              value={duration}
-              onChange={(e)=>setDuration(e.target.value)}
+              placeholder="Empty = from start"
+              value={startTime}
+              onChange={(e)=>setStartTime(e.target.value)}
+              style={{ width: 160 }}
             />
           </div>
+          <div className="row" style={{alignItems:"center", gap: 12}}>
+            <div style={{minWidth: 110}}>End Time (s)</div>
+            <input
+              type="number"
+              min={0}
+              step={0.1}
+              placeholder="Empty = to end"
+              value={endTime}
+              onChange={(e)=>setEndTime(e.target.value)}
+              style={{ width: 160 }}
+            />
+          </div>
+          {fileInfo?.duration ? (
+            <div className="muted">Video duration: <b>{fileInfo.duration.toFixed(1)}s</b></div>
+          ) : null}
         </div>
       </div>
 

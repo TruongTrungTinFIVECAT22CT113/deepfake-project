@@ -25,10 +25,17 @@ _DETECTORS_INFO: List[dict] = []
 _MODELS_META: List[Dict[str, Any]] = []
 _METHOD_NAMES: List[str] | None = None
 
-def _clip_first_seconds(src_path: str, seconds: float) -> Optional[str]:
+def _clip_range(src_path: str, start_sec: float | None, end_sec: float | None) -> Optional[str]:
+    """
+    Trả về đường dẫn video tạm đã cắt theo [start_sec, end_sec].
+    - start_sec None => từ đầu
+    - end_sec None   => tới hết
+    - Nếu không cắt được, trả None để dùng full video.
+    """
     try:
-        if seconds is None or seconds <= 0:
+        if (start_sec is None or start_sec < 0) and (end_sec is None or end_sec < 0):
             return None
+
         cap = cv2.VideoCapture(src_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 0
         if fps <= 0:
@@ -39,31 +46,38 @@ def _clip_first_seconds(src_path: str, seconds: float) -> Optional[str]:
         if w <= 0 or h <= 0:
             cap.release()
             return None
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        max_frames = int(seconds * fps + 0.5)
-        if max_frames <= 0:
+        # chuyển sang frame index
+        start_f = 0 if not start_sec or start_sec < 0 else int(start_sec * fps + 0.5)
+        end_f = total_frames if (end_sec is None or end_sec < 0) else int(end_sec * fps + 0.5)
+        start_f = max(0, min(start_f, total_frames))
+        end_f = max(0, min(end_f, total_frames))
+        if end_f <= start_f:
             cap.release()
             return None
+
+        # seek tới start_f
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
         writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
 
-        count = 0
-        while count < max_frames:
+        fidx = start_f
+        while fidx < end_f:
             ok, frame = cap.read()
             if not ok:
                 break
             writer.write(frame)
-            count += 1
+            fidx += 1
 
         writer.release()
         cap.release()
-        if count == 0:
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
+
+        if fidx <= start_f:
+            try: os.remove(out_path)
+            except Exception: pass
             return None
         return out_path
     except Exception:
@@ -149,13 +163,12 @@ def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
-    # Advanced only (FE): detector + bbox_scale + optional thr override
-    detector_backend: str = Form("retinaface"),   # "retinaface" | "mediapipe"
+    detector_backend: str = Form("retinaface"),
     bbox_scale: float = Form(1.10),
-    thr: float | None = Form(None),               # FE override; ignored if >=2 models
-    # Other
+    thr: float | None = Form(None),
     thickness: int = Form(3),
-    duration_sec: float | None = Form(None),
+    start_sec: float | None = Form(None),   # NEW
+    end_sec: float | None = Form(None),     # NEW
 ):
     if not _DETECTORS_INFO:
         return JSONResponse({"error":"Model chưa sẵn sàng"}, status_code=503)
@@ -182,8 +195,7 @@ async def analyze(
 
     clip_path = None
     try:
-        if duration_sec is not None:
-            clip_path = _clip_first_seconds(src_path, float(duration_sec))
+        clip_path = _clip_range(src_path, start_sec, end_sec)
         use_path = clip_path or src_path
 
         out_path, verdict, stats, method_rows = analyze_video(
