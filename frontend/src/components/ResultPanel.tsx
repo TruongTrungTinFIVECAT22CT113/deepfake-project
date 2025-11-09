@@ -7,13 +7,15 @@ type NewFields = {
   threshold_used?: number;
   thr_override_ignored?: boolean;
   detector_backend_used?: string;
+  method_rows_total?: [string, number][];
+  method_rows_fake?: [string, number][];
+  method_rows?: [string, number][];
 };
 
 export default function ResultPanel(props: {
   result?: {
     verdict: string;
     video_url: string;
-    method_rows?: [string, number][];
   } & NewFields;
   loading?: boolean;
 }): JSX.Element | null {
@@ -34,10 +36,40 @@ export default function ResultPanel(props: {
   }
   if (!r) return <div className="muted">No result yet. Upload a video and analyze.</div>;
 
-  const framesLine =
-    r.frames_total !== undefined && r.fake_frames !== undefined && r.fake_ratio !== undefined
-      ? `Frames: ${r.frames_total} | Fake-frames: ${r.fake_frames} (${(r.fake_ratio * 100).toFixed(1)}%)`
-      : null;
+const framesLine =
+  r.frames_total !== undefined &&
+  r.fake_frames !== undefined &&
+  r.fake_ratio !== undefined
+    ? (() => {
+        const realFrames = r.frames_total - r.fake_frames;
+        const realRatio = 1 - r.fake_ratio;
+        return (
+          <span>
+            <b>Total-frames:</b> {r.frames_total}{" "}
+            | <b style={{ color: "#df4040" }}>Fake-frames:</b> {r.fake_frames}{" "}
+            (<span style={{ color: "#df4040" }}>
+              {(r.fake_ratio * 100).toFixed(1)}%
+            </span>)
+            {" | "}
+            <b style={{ color: "#40d078" }}>Real-frames:</b> {realFrames}{" "}
+            (<span style={{ color: "#40d078" }}>
+              {(realRatio * 100).toFixed(1)}%
+            </span>)
+          </span>
+        );
+      })()
+    : null;
+
+  // Prefer % of all frames; fallback -> % of fake frames; final fallback -> whatever BE provided
+  const rows = (r.method_rows_total && r.method_rows_total.length ? r.method_rows_total
+              : (r.method_rows_fake && r.method_rows_fake.length ? r.method_rows_fake
+              : (r.method_rows || [])));
+
+  const title = r.method_rows_total && r.method_rows_total.length
+    ? "Method distribution (of all frames)"
+    : (r.method_rows_fake && r.method_rows_fake.length
+        ? "Method distribution (fake frames)"
+        : "Method distribution");
 
   return (
     <div className="stack">
@@ -61,13 +93,13 @@ export default function ResultPanel(props: {
         <div className="warn">Multiple models enabled → average threshold used (override ignored).</div>
       )}
 
-      {r.method_rows?.length ? (
+      {rows?.length ? (
         <div className="stack">
-          <div className="section-title">Method distribution (fake frames)</div>
+          <div className="section-title">{title}</div>
           <table className="pretty">
             <thead><tr><th>Method</th><th style={{width:120}}>Percent</th><th></th></tr></thead>
             <tbody>
-              {r.method_rows.map(([m, p], i) => (
+              {rows.map(([m, p], i) => (
                 <tr key={i}>
                   <td>{m}</td>
                   <td>{typeof p === 'number' ? p.toFixed(1) : p}%</td>

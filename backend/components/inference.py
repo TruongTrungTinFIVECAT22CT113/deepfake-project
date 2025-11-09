@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Strict pipeline (default, non-optional) — MATCH backend_eval.py preprocessing:
-- Face crop -> use BGR crop and feed through transforms.ToPILImage (no BGR->RGB swap)
-- No TTA, no filters, no method gate, no auto threshold
-- Threshold:
-    * 1 model -> use its best_thr (overridable by FE 'thr')
-    * >=2 models -> average best_thr (ignore FE override)
-- Detector backend: try requested (default retinaface); fallback only if allow_fallback=True
-"""
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
@@ -183,7 +174,12 @@ def analyze_video(
 
         # draw box+label on RGB frame for output video only
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        label = "Fake" if is_fake else "Real"
+        if is_fake and len(mnames) > 0:
+            m_idx = int(np.argmax(pm))
+            label = mnames[m_idx]   # show method name instead of just "Fake"
+        else:
+            label = "Real"
+
         draw_box_with_label_np(
             frame_rgb, [x1,y1,x2,y2], label,
             color=(223,64,64) if is_fake else (64,208,120),
@@ -208,14 +204,24 @@ def analyze_video(
     duration_sec = frames_total / fps if fps > 0 else 0.0
     verdict = render_verdict_text(frames_total, fake_frames)
 
-    # method distribution table (percent by fake frames)
-    method_rows: List[Tuple[str, float]] = []
-    if len(mnames) > 0 and fake_frames > 0:
+    # method distribution tables
+    method_rows_fake: List[Tuple[str, float]] = []
+    method_rows_total: List[Tuple[str, float]] = []
+
+    if len(mnames) > 0:
         counts = np.array([m_count[m] for m in mnames], dtype=np.float64)
-        if counts.sum() > 0:
-            perc = 100.0 * counts / counts.sum()
-            idx = np.argsort(-perc)
-            method_rows = [(mnames[int(i)], float(perc[int(i)])) for i in idx]
+
+        # A) % by fake frames (giữ để tương thích)
+        if fake_frames > 0 and counts.sum() > 0:
+            perc_fake = 100.0 * counts / counts.sum()
+            idx = np.argsort(-perc_fake)
+            method_rows_fake = [(mnames[int(i)], float(perc_fake[int(i)])) for i in idx]
+
+        # B) % by total frames (mới – tránh hiểu lầm)
+        if frames_total > 0:
+            perc_total = 100.0 * counts / float(frames_total)
+            idx2 = np.argsort(-perc_total)
+            method_rows_total = [(mnames[int(i)], float(perc_total[int(i)])) for i in idx2]
 
     stats = {
         "frames_total": int(frames_total),
@@ -229,4 +235,5 @@ def analyze_video(
         "method_distribution": {k: int(v) for k, v in m_count.items()},
     }
 
-    return out_path, verdict, stats, method_rows
+    # Trả cả 2: FE sẽ ưu tiên *_total
+    return out_path, verdict, stats, method_rows_total or method_rows_fake

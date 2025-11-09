@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import os, tempfile
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Form, Body
 from fastapi.responses import FileResponse, JSONResponse
@@ -129,6 +129,23 @@ def set_models_enabled(payload: Dict[str, List[str]] = Body(...)):
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
     return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"], "best_thr": m["best_thr"]} for m in _MODELS_META]
 
+def _build_method_rows(counts: Dict[str, int], total_frames: int) -> List[Tuple[str, float]]:
+    rows: List[Tuple[str, float]] = []
+    if total_frames <= 0: return rows
+    for k, v in counts.items():
+        rows.append((k, 100.0 * float(v) / float(total_frames)))
+    rows.sort(key=lambda x: -x[1])
+    return rows
+
+def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
+    rows: List[Tuple[str, float]] = []
+    s = sum(counts.values())
+    if s <= 0: return rows
+    for k, v in counts.items():
+        rows.append((k, 100.0 * float(v) / float(s)))
+    rows.sort(key=lambda x: -x[1])
+    return rows
+
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -183,6 +200,14 @@ async def analyze(
         if not out_path:
             return JSONResponse({"error": verdict or "Phân tích thất bại."}, status_code=400)
 
+        # ---- Build both tables from counts to avoid ambiguity ----
+        frames_total = int(stats.get("frames_total", 0))
+        fake_frames  = int(stats.get("fake_frames", 0))
+        counts: Dict[str, int] = {k: int(v) for k, v in (stats.get("method_distribution") or {}).items()}
+
+        method_rows_total = _build_method_rows(counts, frames_total)
+        method_rows_fake  = _build_method_rows_fake(counts)
+
         token = os.path.basename(os.path.dirname(out_path))
         fname = "result.mp4"
         final_path = os.path.join(os.path.dirname(out_path), fname)
@@ -192,19 +217,22 @@ async def analyze(
             except Exception:
                 pass
 
+        # legacy 'method_rows' -> default to TOTAL (clearer)
         return {
             "verdict": verdict,
             "video_url": f"/api/download/{token}/{fname}",
-            "frames_total": stats.get("frames_total", 0),
-            "fake_frames": stats.get("fake_frames", 0),
+            "frames_total": frames_total,
+            "fake_frames": fake_frames,
             "fake_ratio": stats.get("fake_ratio", 0.0),
             "fps": stats.get("fps", 0.0),
             "duration_sec": stats.get("duration_sec", 0.0),
             "threshold_used": float(thr_used),
             "thr_override_ignored": thr_override_ignored,
             "detector_backend_used": stats.get("detector_backend_used"),
-            "method_rows": method_rows,
-            "method_distribution": stats.get("method_distribution", {}),
+            "method_rows_total": method_rows_total,
+            "method_rows_fake": method_rows_fake,
+            "method_rows": method_rows_total,  # legacy
+            "method_distribution": counts,
         }
     finally:
         try:
