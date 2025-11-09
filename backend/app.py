@@ -196,8 +196,10 @@ async def analyze(
     clip_path = None
     try:
         clip_path = _clip_range(src_path, start_sec, end_sec)
-        use_path = clip_path or src_path
+        start_used = float(start_sec) if start_sec is not None else None
+        end_used = float(end_sec) if end_sec is not None else None
 
+        use_path = clip_path or src_path
         out_path, verdict, stats, method_rows = analyze_video(
             use_path,
             chosen,
@@ -246,6 +248,8 @@ async def analyze(
             "method_rows": method_rows_total,  # legacy
             "method_distribution": counts,
             "frame_tags": stats.get("frame_tags", []),
+            "analyzed_start_sec": start_used if clip_path else None,
+            "analyzed_end_sec": end_used if clip_path else None,
         }
     finally:
         try:

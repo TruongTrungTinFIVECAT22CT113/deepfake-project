@@ -13,6 +13,10 @@ type NewFields = {
   frame_tags?: string[];  // per-frame labels from BE
   fps?: number;
   duration_sec?: number;
+
+  // NEW: BE nên echo lại khoảng phân tích (nếu có)
+  analyzed_start_sec?: number | null;
+  analyzed_end_sec?: number | null;
 };
 
 // --- Colors: Real + ranked methods ---
@@ -35,7 +39,7 @@ function buildColorMap(tags: string[]): Record<string, string> {
 
 // --- Time ruler helpers ---
 function formatTimeLabel(sec: number, isEnd = false) {
-  // Tick cuối cùng: nếu không phải số nguyên giây thì hiện 1 chữ số thập phân để tránh trùng nhãn
+  // Tick cuối: nếu không nguyên giây thì hiển thị 1 chữ số thập phân để tránh trùng nhãn
   if (isEnd && !Number.isInteger(sec)) {
     const v = Math.max(0, sec);
     if (v < 60) return `${v.toFixed(1)}s`;
@@ -53,6 +57,22 @@ function chooseTickStep(duration: number) {
   if (duration <= 60) return 5;
   if (duration <= 180) return 10;
   return 30;
+}
+
+// NEW: hiển thị “Analyzed range”
+function formatAnalyzedRange(
+  dur: number | undefined,
+  aStart?: number | null,
+  aEnd?: number | null
+) {
+  if (!dur || dur <= 0) return null;
+  // Nếu BE không echo gì → full video
+  if (aStart == null && aEnd == null) return "Analyzed: full video";
+  const start = aStart == null ? 0 : Math.max(0, aStart);
+  const end = aEnd == null ? dur : Math.max(0, Math.min(dur, aEnd));
+  if (end <= start) return "Analyzed: full video";
+  const fmt = (s: number) => (s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s/60)}:${String((s%60).toFixed(1)).padStart(4,"0")}`);
+  return `Analyzed: ${fmt(start)} → ${fmt(end)}`;
 }
 
 export default function ResultPanel(props: {
@@ -119,6 +139,17 @@ export default function ResultPanel(props: {
   const totalFrames = typeof r.frames_total === "number" ? r.frames_total : (tags?.length || 0);
   const cmap = buildColorMap(tags);
 
+  // Duration used for timeline/ruler
+  const duration =
+    typeof r.duration_sec === "number" && r.duration_sec > 0
+      ? r.duration_sec
+      : (totalFrames > 0
+          ? totalFrames / (typeof r.fps === "number" && r.fps > 0 ? r.fps : 25)
+          : 0);
+
+  // NEW: analyzed range label
+  const analyzedLabel = formatAnalyzedRange(duration, r.analyzed_start_sec ?? null, r.analyzed_end_sec ?? null);
+
   return (
     <div className="stack">
       <video ref={videoRef} src={r.video_url} className="media" controls />
@@ -135,6 +166,8 @@ export default function ResultPanel(props: {
       </div>
 
       {framesLine && <div style={{ fontWeight: 600 }}>{framesLine}</div>}
+      {/* NEW: show analyzed range (full video or start→end) */}
+      {analyzedLabel && <div className="muted">{analyzedLabel}</div>}
 
       {typeof r.threshold_used === "number" && (
         <div className="muted">Threshold used: <b>{r.threshold_used.toFixed(3)}</b></div>
@@ -175,13 +208,6 @@ export default function ResultPanel(props: {
 
           {/* Time ruler under the timeline */}
           {(() => {
-            const duration =
-              typeof r.duration_sec === "number" && r.duration_sec > 0
-                ? r.duration_sec
-                : (totalFrames > 0
-                    ? totalFrames / (typeof r.fps === "number" && r.fps > 0 ? r.fps : 25)
-                    : 0);
-
             if (!duration || duration <= 0) return null;
 
             const step = chooseTickStep(duration);

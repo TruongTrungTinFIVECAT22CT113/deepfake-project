@@ -77,8 +77,14 @@ export default function AnalyzerForm({
 const startRaw = parseSec(startTime);
 const endRaw = parseSec(endTime);
 
-if (startRaw === (NaN as any)) { addToast("Start Time must be ≥ 0 seconds or empty", "error"); return; }
-if (endRaw === (NaN as any)) { addToast("End Time must be ≥ 0 seconds or empty", "error"); return; }
+if (Number.isNaN(startRaw as number)) {
+  addToast("Start Time must be ≥ 0 seconds or empty", "error");
+  return;
+}
+if (Number.isNaN(endRaw as number)) {
+  addToast("End Time must be ≥ 0 seconds or empty", "error");
+  return;
+}
 
 // Chuẩn hoá theo duration (nếu có metadata)
 let sVal: number | undefined = startRaw as number | undefined;
