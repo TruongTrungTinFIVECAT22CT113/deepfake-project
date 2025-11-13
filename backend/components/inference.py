@@ -280,11 +280,7 @@ def analyze_video(
                     cam = None
 
                 if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
-                    # scale theo p_fake:
-                    #   - fake (p_fake ~ 0.8–1.0)  -> heatmap mạnh
-                    #   - real (p_fake nhỏ)       -> heatmap rất nhạt
                     scale = float(pf)
-                    # đảm bảo vẫn có chút tín hiệu (0.05) nhưng không vượt 1.0
                     scale = max(0.05, min(1.0, scale))
                     cam_scaled = cam * scale
 
@@ -294,11 +290,11 @@ def analyze_video(
             except Exception:
                 pass
 
-            # không dùng Grad-CAM
-            if use_imageio:
-                writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
-            else:
-                vout.write(out_bgr)
+        # GHI FRAME RA VIDEO DÙ CÓ CAM HAY KHÔNG
+        if use_imageio and writer is not None:
+            writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+        elif (not use_imageio) and vout is not None:
+            vout.write(out_bgr)
 
     cap.release()
     if use_imageio and writer is not None:

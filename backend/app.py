@@ -243,6 +243,8 @@ async def analyze(
 
         if not out_path:
             return JSONResponse({"error": verdict or "Phân tích thất bại."}, status_code=400)
+        if (not out_path) or (not os.path.isfile(out_path)):
+            return JSONResponse({"error": verdict or "Không tạo được video kết quả."}, status_code=500)
 
         # ---- Build both tables from counts to avoid ambiguity ----
         frames_total = int(stats.get("frames_total", 0))
