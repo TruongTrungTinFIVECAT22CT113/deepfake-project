@@ -14,6 +14,7 @@ from components.model import load_multiple_detectors, discover_checkpoints
 from components.inference import analyze_video
 from components.face_detection import retinaface_available
 from components.utils import average_threshold
+from components.artifact_profiles import ARTIFACT_PROFILES
 
 app = FastAPI(title="Deepfake Detect API (Strict Pipeline)", version="2.0")
 app.add_middleware(
@@ -160,6 +161,33 @@ def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
     rows.sort(key=lambda x: -x[1])
     return rows
 
+def _build_basic_explanation(
+    method_rows_total: List[Tuple[str, float]],
+    method_rows_fake: List[Tuple[str, float]],
+    fake_ratio: float,
+) -> Optional[Dict[str, Any]]:
+    # Nếu real chiếm áp đảo, không cần giải thích chi tiết
+    # 0.5 = ít nhất 50% frame bị phát hiện giả mới giải thích
+    if fake_ratio < 0.75:
+        return None
+
+    rows = method_rows_total or method_rows_fake
+    if not rows:
+        return None
+
+    top_method, top_pct = rows[0]
+    profile = ARTIFACT_PROFILES.get(top_method)
+    if profile is None:
+        return None
+
+    return {
+        "method": top_method,
+        "method_share": float(top_pct),
+        "fake_ratio": float(fake_ratio),
+        "summary": profile["summary"],
+        "artifacts": profile["artifacts"],
+    }
+
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -221,6 +249,12 @@ async def analyze(
 
         method_rows_total = _build_method_rows(counts, frames_total)
         method_rows_fake  = _build_method_rows_fake(counts)
+        fake_ratio = float(stats.get("fake_ratio", 0.0))
+        explanation_basic = _build_basic_explanation(
+            method_rows_total,
+            method_rows_fake,
+            fake_ratio,
+        )
 
         token = os.path.basename(os.path.dirname(out_path))
         fname = "result.mp4"
@@ -250,6 +284,7 @@ async def analyze(
             "frame_tags": stats.get("frame_tags", []),
             "analyzed_start_sec": start_used if clip_path else None,
             "analyzed_end_sec": end_used if clip_path else None,
+            "explanation_basic": explanation_basic,
         }
     finally:
         try:

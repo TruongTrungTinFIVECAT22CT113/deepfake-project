@@ -17,7 +17,17 @@ type NewFields = {
   // NEW: BE nên echo lại khoảng phân tích (nếu có)
   analyzed_start_sec?: number | null;
   analyzed_end_sec?: number | null;
+  explanation_basic?: ExplanationBasic;
 };
+
+type ExplanationBasic = {
+  method: string;
+  method_share: number;        // percent %
+  fake_ratio?: number;         // 0..1
+  summary: string;
+  artifacts: [string, string][]; // [name, description][]
+};
+
 
 // --- Colors: Real + ranked methods ---
 const METHOD_PALETTE = ["#df4040", "#eab308", "#f97316", "#92400e", "#7c3aed", "#2563eb", "#6b7280"]; // đỏ, vàng, cam, nâu, tím, xanh dương, xám
@@ -298,6 +308,29 @@ export default function ResultPanel(props: {
           </table>
         </div>
       ) : null}
+
+      {r.explanation_basic && (
+        <div className="stack">
+          <div className="section-title">
+            Explanation (basic) – {r.explanation_basic.method}
+          </div>
+          <div className="muted">
+            <p>
+              Phương pháp kỹ thuật <b>{r.explanation_basic.method}</b> chiếm khoảng{" "}
+              <b>{r.explanation_basic.method_share.toFixed(1)}%</b> số khung hình (tính trên toàn bộ video), tỷ lệ tổng số khung hình bị phát hiện là giả chiếm{" "}
+              <b>{((r.explanation_basic.fake_ratio ?? r.fake_ratio ?? 0) * 100).toFixed(1)}%</b>.
+            </p>
+            <p>{r.explanation_basic.summary}</p>
+            <ul>
+              {r.explanation_basic.artifacts.map(([name, desc]) => (
+                <li key={name}>
+                  <b>{name}:</b> {desc}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
       <div className="actions">
         <a className="btn small" href={r.video_url} download>Download result</a>
