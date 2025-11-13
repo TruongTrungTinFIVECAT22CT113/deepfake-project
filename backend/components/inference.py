@@ -11,6 +11,7 @@ from torchvision import transforms
 
 from .utils import draw_box_with_label_np, render_verdict_text, average_threshold
 from .face_detection import crop_largest_face
+from .xai_cam import generate_cam_vit, generate_cam_cnn, overlay_heatmap_on_bgr
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -57,7 +58,53 @@ def _ensemble_predict_bgr_crop(
     else:
         return p_fake_sum/n, p_real_sum/n, np.zeros(1, dtype=np.float32)
 
-@torch.no_grad()
+def _flush_bucket_with_cam(
+    frames: List[dict],
+    model,
+    device,
+    is_vit: bool,
+    cnn_target_layer,
+    tx,
+):
+    """Áp Grad-CAM vào 1 frame fake có p_fake cao nhất trong bucket (≈ 1 giây)."""
+    if not frames:
+        return
+    best_idx = None
+    best_p = -1.0
+    for i, rec in enumerate(frames):
+        if not rec.get("is_fake"):
+            continue
+        p = float(rec.get("p_fake") or 0.0)
+        if p > best_p:
+            best_p = p
+            best_idx = i
+    if best_idx is None:
+        return  # không có frame fake trong giây này
+
+    rec = frames[best_idx]
+    crop = rec.get("crop_bgr")
+    box = rec.get("box")
+    if crop is None or box is None:
+        return
+    x1, y1, x2, y2 = box
+
+    try:
+        x = tx(crop)  # CHW
+        x = x.unsqueeze(0).to(device, non_blocking=True)
+        if is_vit:
+            cam = generate_cam_vit(model, x, device=str(device))
+        elif cnn_target_layer is not None:
+            cam = generate_cam_cnn(model, x, target_layer=cnn_target_layer, device=str(device))
+        else:
+            return
+        heat_crop = overlay_heatmap_on_bgr(crop, cam)
+        out_bgr = rec["out_bgr"]
+        if (x2 - x1) > 0 and (y2 - y1) > 0:
+            heat_resized = cv2.resize(heat_crop, (x2 - x1, y2 - y1))
+            out_bgr[y1:y2, x1:x2] = heat_resized
+    except Exception:
+        return
+
 def analyze_video(
     video_path: str,
     detectors_info: List[dict],
@@ -72,6 +119,7 @@ def analyze_video(
     box_thickness: int = 3,
     # strict fallback control (match eval by default)
     allow_fallback: bool = False,
+    xai_mode: str = "none",
 ):
     # ---------- choose threshold ----------
     if len(detectors_info) <= 0:
@@ -131,6 +179,18 @@ def analyze_video(
     m_count = {m: 0 for m in mnames}
     backend_used_final = None
     frame_tags: List[str] = []  # NEW: per-frame label ("Real" or method name)
+        # ---------- XAI / Grad-CAM mode ----------
+    xai_mode = (xai_mode or "none").lower()
+    enable_xai = xai_mode in ("single", "full")
+
+    # dùng model đầu tiên làm “primary” cho Grad-CAM
+    primary_info = detectors_info[0]
+    primary_model = primary_info["model"]
+    primary_device = primary_info["device"]
+    # heuristics: ViT timm có .blocks
+    backbone = getattr(primary_model, "backbone", primary_model)
+    is_vit = hasattr(backbone, "blocks")
+    cnn_target_layer = None  # TODO: gán layer conv cuối nếu sau này có CNN
 
     while True:
         ok, frame_bgr = cap.read()
@@ -172,7 +232,7 @@ def analyze_video(
             if len(mnames) > 0:
                 m_idx = int(np.argmax(pm))
                 m_count[mnames[m_idx]] += 1
-                frame_tags.append(mnames[m_idx])   # tag = method name
+                frame_tags.append(mnames[m_idx])
             else:
                 frame_tags.append("Fake")
         else:
@@ -182,7 +242,7 @@ def analyze_video(
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         if is_fake and len(mnames) > 0:
             m_idx = int(np.argmax(pm))
-            label = mnames[m_idx]   # show method name instead of just "Fake"
+            label = mnames[m_idx]
         else:
             label = "Real"
 
@@ -192,14 +252,53 @@ def analyze_video(
             thickness=int(box_thickness)
         )
         out_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-        if use_imageio:
+
+        if enable_xai and crop_bgr is not None:
             try:
-                import imageio.v2 as imageio  # type: ignore
-                writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+                x = tx(crop_bgr)  # CHW
+                x = x.unsqueeze(0).to(primary_device, non_blocking=True)
+
+                # LUÔN dùng lớp "fake" (index=0) làm target cho Grad-CAM
+                target_idx = 0
+
+                if is_vit:
+                    cam = generate_cam_vit(
+                        primary_model,
+                        x,
+                        target_index=target_idx,
+                        device=str(primary_device),
+                    )
+                elif cnn_target_layer is not None:
+                    cam = generate_cam_cnn(
+                        primary_model,
+                        x,
+                        target_index=target_idx,
+                        target_layer=cnn_target_layer,
+                        device=str(primary_device),
+                    )
+                else:
+                    cam = None
+
+                if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
+                    # scale theo p_fake:
+                    #   - fake (p_fake ~ 0.8–1.0)  -> heatmap mạnh
+                    #   - real (p_fake nhỏ)       -> heatmap rất nhạt
+                    scale = float(pf)
+                    # đảm bảo vẫn có chút tín hiệu (0.05) nhưng không vượt 1.0
+                    scale = max(0.05, min(1.0, scale))
+                    cam_scaled = cam * scale
+
+                    heat_crop = overlay_heatmap_on_bgr(crop_bgr, cam_scaled)
+                    heat_resized = cv2.resize(heat_crop, (x2 - x1, y2 - y1))
+                    out_bgr[y1:y2, x1:x2] = heat_resized
             except Exception:
                 pass
-        else:
-            vout.write(out_bgr)
+
+            # không dùng Grad-CAM
+            if use_imageio:
+                writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+            else:
+                vout.write(out_bgr)
 
     cap.release()
     if use_imageio and writer is not None:

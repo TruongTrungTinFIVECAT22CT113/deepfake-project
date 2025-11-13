@@ -12,7 +12,7 @@ class ArtifactProfile(TypedDict):
 ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
     "Audio2Animation": {
         "summary": (
-            "Audio2Animation sinh khuôn mặt từ giọng nói. "
+            "Audio2Animation sinh biểu cảm khuôn mặt từ giọng nói. "
             "Thường lộ lỗi ở vùng miệng và chuyển động đầu, vì phải "
             "suy ra chuyển động từ âm thanh chứ không dựa vào cảnh thật."
         ),

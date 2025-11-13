@@ -26,6 +26,7 @@ export type AnalyzeOptions = {
   end_sec?: number;          // NEW
   // Models
   enabled_ids_csv?: string;
+  xai_mode?: string;
 };
 
 const API_BASE = "";
@@ -80,6 +81,7 @@ export async function analyzeVideo(
 
   // Models
   if (opts.enabled_ids_csv) fd.append("enabled_ids_csv", opts.enabled_ids_csv);
+  if (opts.xai_mode) fd.append("xai_mode", opts.xai_mode);
 
   const r = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: fd });
   if (!r.ok) throw new Error(await r.text());

@@ -316,8 +316,8 @@ export default function ResultPanel(props: {
           </div>
           <div className="muted">
             <p>
-              Phương pháp kỹ thuật <b>{r.explanation_basic.method}</b> chiếm khoảng{" "}
-              <b>{r.explanation_basic.method_share.toFixed(1)}%</b> số khung hình (tính trên toàn bộ video), tỷ lệ tổng số khung hình bị phát hiện là giả chiếm{" "}
+              Kỹ thuật <b>{r.explanation_basic.method}</b> chiếm {" "}
+              <b>{r.explanation_basic.method_share.toFixed(1)}%</b> số khung hình (tính trên toàn bộ video), tỷ lệ tổng số khung hình bị phát hiện là giả chiếm {" "}
               <b>{((r.explanation_basic.fake_ratio ?? r.fake_ratio ?? 0) * 100).toFixed(1)}%</b>.
             </p>
             <p>{r.explanation_basic.summary}</p>

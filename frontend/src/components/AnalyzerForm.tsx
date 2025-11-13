@@ -33,6 +33,8 @@ export default function AnalyzerForm({
   const numEnabled = enabledIds?.length ?? 0;
   const isMultiModel = numEnabled >= 2;
 
+  const [xaiMode, setXaiMode] = useState<"none" | "full">("none");
+
   function formatBytes(b: number) {
     const units = ["B","KB","MB","GB"]; let i = 0; let v = b;
     while (v >= 1024 && i < units.length-1) { v /= 1024; i++; }
@@ -122,6 +124,7 @@ const opts: AnalyzeOptions = {
   end_sec: eVal,     // có thể undefined
   enabled_ids_csv: enabledIds && enabledIds.length ? enabledIds.join(",") : undefined,
   thr: (!isMultiModel && thrOverride.trim() !== "") ? Number(thrOverride) : undefined,
+  xai_mode: xaiMode,  // NEW
 };
 
     setLoading(true);
@@ -241,6 +244,25 @@ const opts: AnalyzeOptions = {
               onChange={(e)=>setThrOverride(e.target.value)}
               disabled={isMultiModel}
             />
+          </div>
+          <div className="row">
+            <div>Grad-CAM</div>
+            <div className="segmented" role="group" aria-label="Grad-CAM toggle">
+              <button
+                type="button"
+                aria-pressed={xaiMode === "none"}
+                onClick={() => setXaiMode("none")}
+              >
+                Off
+              </button>
+              <button
+                type="button"
+                aria-pressed={xaiMode === "full"}
+                onClick={() => setXaiMode("full")}
+              >
+                On (full video)
+              </button>
+            </div>
           </div>
 
           {isMultiModel && (

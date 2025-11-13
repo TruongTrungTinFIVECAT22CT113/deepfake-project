@@ -197,6 +197,7 @@ async def analyze(
     thickness: int = Form(3),
     start_sec: float | None = Form(None),   # NEW
     end_sec: float | None = Form(None),     # NEW
+    xai_mode: str = Form("none"),
 ):
     if not _DETECTORS_INFO:
         return JSONResponse({"error":"Model chưa sẵn sàng"}, status_code=503)
@@ -237,6 +238,7 @@ async def analyze(
             bbox_scale=float(bbox_scale),
             det_thr=0.5,
             box_thickness=int(thickness),
+            xai_mode=xai_mode,  # NEW
         )
 
         if not out_path:
