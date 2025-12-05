@@ -15,15 +15,31 @@ class MultiHeadViT(nn.Module):
                  num_methods: int, num_face_classes: int, num_head_classes: int, num_full_classes: int,
                  drop_rate: float=0.0, drop_path_rate: float=0.0):
         super().__init__()
+
+        # Chuẩn bị kwargs cho timm.create_model
+        backbone_kwargs = dict(
+            pretrained=False,
+            num_classes=0,
+            drop_rate=drop_rate,
+            drop_path_rate=drop_path_rate,
+        )
+
+        # Chỉ những backbone kiểu ViT / Swin / BEiT... mới nhận img_size
+        if any(k in model_name.lower() for k in ["vit", "swin", "beit", "deit", "cait"]):
+            backbone_kwargs["img_size"] = img_size
+
+        # ConvNeXt (vd: convnext_base.fb_in22k_ft_in1k_384) sẽ KHÔNG bị nhồi img_size nữa
         self.backbone = timm.create_model(
-            model_name, pretrained=False, num_classes=0, img_size=img_size,
-            drop_rate=drop_rate, drop_path_rate=drop_path_rate
+            model_name,
+            **backbone_kwargs,
         )
         feat = self.backbone.num_features
 
         def head(n):
-            return nn.Sequential(nn.Dropout(p=drop_rate if drop_rate > 0 else 0.0),
-                                 nn.Linear(feat, n))
+            return nn.Sequential(
+                nn.Dropout(p=drop_rate if drop_rate > 0 else 0.0),
+                nn.Linear(feat, n)
+            )
 
         self.head_bin  = head(2)
         self.head_met  = head(num_methods)

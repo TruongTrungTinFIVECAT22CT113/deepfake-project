@@ -132,7 +132,7 @@ const opts: AnalyzeOptions = {
       const res = await analyzeVideo(f, opts);
       onResult(res);
       if (res?.thr_override_ignored) {
-        addToast("Multiple models enabled → using average threshold; override ignored. Warning");
+        addToast("Multiple models enabled → using ensemble threshold; override ignored.");
       } else {
         addToast("Analysis complete", "success");
       }
@@ -267,7 +267,7 @@ const opts: AnalyzeOptions = {
 
           {isMultiModel && (
             <div className="muted">
-              Multiple models are enabled. The backend will use the <b>average threshold</b> and ignore override.
+              Multiple models are enabled. The backend will use the ensemble threshold and ignore override.
             </div>
           )}
         </div>

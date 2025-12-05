@@ -8,13 +8,15 @@ import cv2
 import torch
 from PIL import Image
 from torchvision import transforms
+import torch.nn as nn
 
-from .utils import draw_box_with_label_np, render_verdict_text, average_threshold
+from .utils import draw_box_with_label_np, render_verdict_text
 from .face_detection import crop_largest_face
 from .xai_cam import generate_cam_vit, generate_cam_cnn, overlay_heatmap_on_bgr
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
+ENSEMBLE_THR_DEFAULT = 0.55 
 
 def build_eval_transform(img_size: int):
     # exactly like backend_eval.py: ToPILImage() expects HxWxC array; we pass BGR array as-is
@@ -105,6 +107,41 @@ def _flush_bucket_with_cam(
     except Exception:
         return
 
+def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
+    """
+    Cố gắng đoán layer conv cuối cùng để dùng cho Grad-CAM CNN.
+    Ưu tiên:
+      - ConvNeXt: backbone.stages[-1][-1]
+      - ResNet-like: layer4 / layers4 / block4 / stage4
+      - Fallback: conv2d cuối cùng trong model
+    """
+    # 1) ConvNeXt: timm ConvNeXt có thuộc tính .stages
+    if hasattr(backbone, "stages"):
+        try:
+            stages = backbone.stages
+            if hasattr(stages, "__len__") and len(stages) > 0:
+                last_stage = stages[-1]
+                if hasattr(last_stage, "__len__") and len(last_stage) > 0:
+                    return last_stage[-1]
+                return last_stage
+        except Exception:
+            pass
+
+    # 2) Các backbone kiểu ResNet / tương tự
+    for attr in ["layer4", "layers4", "block4", "stage4"]:
+        if hasattr(backbone, attr):
+            layer = getattr(backbone, attr)
+            if hasattr(layer, "__len__") and len(layer) > 0:
+                return layer[-1]
+            return layer
+
+    # 3) Fallback: chọn conv2d cuối cùng
+    last_conv = None
+    for m in backbone.modules():
+        if isinstance(m, nn.Conv2d):
+            last_conv = m
+    return last_conv
+
 def analyze_video(
     video_path: str,
     detectors_info: List[dict],
@@ -130,9 +167,8 @@ def analyze_video(
         thr_override_ignored = False
         img_size = int(detectors_info[0].get("img_size", 384))
     else:
-        thr_used = average_threshold(detectors_info)
+        thr_used = ENSEMBLE_THR_DEFAULT
         thr_override_ignored = True
-        # if multiple models have different sizes, use the first's size for tx (matching eval uses a single size)
         img_size = int(detectors_info[0].get("img_size", 384))
 
     tx = build_eval_transform(img_size)
@@ -179,18 +215,36 @@ def analyze_video(
     m_count = {m: 0 for m in mnames}
     backend_used_final = None
     frame_tags: List[str] = []  # NEW: per-frame label ("Real" or method name)
-        # ---------- XAI / Grad-CAM mode ----------
+
+    # ---------- XAI / Grad-CAM mode ----------
     xai_mode = (xai_mode or "none").lower()
     enable_xai = xai_mode in ("single", "full")
 
-    # dùng model đầu tiên làm “primary” cho Grad-CAM
-    primary_info = detectors_info[0]
+    # ---------- chọn model cho Grad-CAM ----------
+    primary_info = None
+    is_vit = False
+    cnn_target_layer = None
+
+    # ƯU TIÊN: chọn ViT (backbone có .blocks)
+    for info in detectors_info:
+        backbone_tmp = getattr(info["model"], "backbone", info["model"])
+        if hasattr(backbone_tmp, "blocks"):
+            primary_info = info
+            is_vit = True
+            break
+
+    # Nếu không có ViT nào → dùng model đầu tiên (CNN), sẽ đoán target_layer để Grad-CAM
+    if primary_info is None:
+        primary_info = detectors_info[0]
+        backbone = getattr(primary_info["model"], "backbone", primary_info["model"])
+        cnn_target_layer = _guess_cnn_target_layer(backbone)
+    else:
+        backbone = getattr(primary_info["model"], "backbone", primary_info["model"])
+        # nếu sau này muốn Grad-CAM CNN cho ViT-wrapper khác thì vẫn có chỗ gắn thêm,
+        # hiện tại ViT dùng generate_cam_vit nên không cần target_layer
+
     primary_model = primary_info["model"]
     primary_device = primary_info["device"]
-    # heuristics: ViT timm có .blocks
-    backbone = getattr(primary_model, "backbone", primary_model)
-    is_vit = hasattr(backbone, "blocks")
-    cnn_target_layer = None  # TODO: gán layer conv cuối nếu sau này có CNN
 
     while True:
         ok, frame_bgr = cap.read()

@@ -16,8 +16,3 @@ def draw_box_with_label_np(img_rgb: np.ndarray, box: List[int], label: str, colo
 def render_verdict_text(frames_total: int, fake_frames: int) -> str:
     ratio = (100.0 * fake_frames / max(1, frames_total))
     return f"Frames: {frames_total} | Fake-frames: {fake_frames} ({ratio:.1f}%)"
-
-def average_threshold(infos: list) -> float:
-    if not infos: return 0.5
-    vals = [float(i.get("best_thr", 0.5)) for i in infos]
-    return float(sum(vals) / max(1, len(vals)))

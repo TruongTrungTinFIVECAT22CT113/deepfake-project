@@ -141,16 +141,37 @@ class MultiBranchDataset(Dataset):
 class MultiHeadViT(nn.Module):
     def __init__(self, model_name: str, img_size: int, num_methods: int,
                  num_face_classes: int, num_head_classes: int, num_full_classes: int,
-                 drop_rate: float=0.0, drop_path_rate: float=0.0):
+                 drop_rate: float = 0.0, drop_path_rate: float = 0.0):
         super().__init__()
-        self.backbone = timm.create_model(
-            model_name, pretrained=True, num_classes=0, img_size=img_size,
-            drop_rate=drop_rate, drop_path_rate=drop_path_rate
-        )
+
+        # Một số model (ViT, BEiT...) nhận img_size, nhưng ConvNeXt, ResNet, EfficientNet... thì không.
+        try:
+            self.backbone = timm.create_model(
+                model_name,
+                pretrained=True,
+                num_classes=0,
+                img_size=img_size,            # dùng được cho ViT/BEiT...
+                drop_rate=drop_rate,
+                drop_path_rate=drop_path_rate
+            )
+        except TypeError:
+            # fallback cho các model không có tham số img_size (ConvNeXt, ResNet, EfficientNet, NFNet...)
+            self.backbone = timm.create_model(
+                model_name,
+                pretrained=True,
+                num_classes=0,
+                drop_rate=drop_rate,
+                drop_path_rate=drop_path_rate
+            )
+
         feat = self.backbone.num_features
+
         def head(n):
-            return nn.Sequential(nn.Dropout(p=drop_rate if drop_rate>0 else 0.0),
-                                 nn.Linear(feat, n))
+            return nn.Sequential(
+                nn.Dropout(p=drop_rate if drop_rate > 0 else 0.0),
+                nn.Linear(feat, n)
+            )
+
         self.head_bin  = head(2)
         self.head_met  = head(num_methods)
         # face head is used; head/full kept for API compatibility (will be unused if empty)
@@ -160,11 +181,13 @@ class MultiHeadViT(nn.Module):
 
     def forward(self, x):
         f = self.backbone(x)
-        return ( self.head_bin(f),
-                 self.head_met(f),
-                 self.head_face(f),
-                 self.head_head(f),
-                 self.head_full(f) )
+        return (
+            self.head_bin(f),
+            self.head_met(f),
+            self.head_face(f),
+            self.head_head(f),
+            self.head_full(f),
+        )
 
 # -------------- EMA (giống train_gru.py) --------------
 class EMA:

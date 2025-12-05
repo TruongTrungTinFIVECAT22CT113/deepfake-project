@@ -1,20 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Batch evaluation for backend (standalone) — mirrors eval_videos_vit_facecrop.py logic.
-
-- For REAL videos:
-    accuracy = r_frames / n_frames, with r_frames = n_frames - f_frames, where f_frames = count(p_fake >= thr)
-- For FAKE videos:
-    video_accuracy = c_frames / n_frames, where c_frames = count(p_fake >= thr AND pred_method == true_method)
-
-- Face detector:
-    default: RetinaFace (InsightFace, GPU if available). Fallback: CPU provider.
-    option:  --detector_backend mediapipe  (CPU)
-
-Outputs:
-    results_real.csv  and  results_fake.csv
-"""
-
 import os, csv, argparse
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
@@ -31,8 +14,18 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
 
-# ---------------- Model khớp train_vit.py (giống eval_videos_vit_facecrop.py) ----------------
+# ---------------- Model khớp train_vit.py / train_spatial.py ----------------
 class MultiHeadViT(nn.Module):
+    """
+    Wrapper timm backbone + 5 head:
+      - head_bin:   2 lớp (real/fake)
+      - head_met:   num_methods
+      - head_face:  num_face_classes
+      - head_head:  num_head_classes
+      - head_full:  num_full_classes
+
+    Dùng chung được cho ViT, ConvNeXt, Swin... miễn timm hỗ trợ model_name.
+    """
     def __init__(self, model_name: str, img_size: int,
                  num_methods: int, num_face_classes: int, num_head_classes: int, num_full_classes: int,
                  drop_rate: float=0.0, drop_path_rate: float=0.0):
@@ -59,6 +52,7 @@ class MultiHeadViT(nn.Module):
         f = self.backbone(x)
         return self.head_bin(f), self.head_met(f), self.head_face(f), self.head_head(f), self.head_full(f)
 
+
 def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
     sizes = {"num_methods": 0, "num_face_classes": 1, "num_head_classes": 1, "num_full_classes": 1}
     if "head_met.1.weight"  in ckpt_model_state: sizes["num_methods"]      = ckpt_model_state["head_met.1.weight"].shape[0]
@@ -67,8 +61,10 @@ def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor])
     if "head_full.1.weight" in ckpt_model_state: sizes["num_full_classes"] = ckpt_model_state["head_full.1.weight"].shape[0]
     return sizes
 
+
 def _filter_state_dict_by_shape(dst_state: Dict[str, torch.Tensor], src_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v for k, v in src_state.items() if k in dst_state and dst_state[k].shape == v.shape}
+
 
 def load_checkpoint_build_model(ckpt_path: str, device: torch.device,
                                 img_size_arg: Optional[int],
@@ -77,7 +73,7 @@ def load_checkpoint_build_model(ckpt_path: str, device: torch.device,
     meta = ckpt.get("meta", {})
     model_state = ckpt.get("model", {})
     if not model_state:
-        raise RuntimeError("Checkpoint thiếu key 'model'.")
+        raise RuntimeError(f"Checkpoint thiếu key 'model': {ckpt_path}")
 
     head_sizes = _infer_head_sizes_from_ckpt_state(model_state)
     num_methods       = head_sizes["num_methods"] or len(meta.get("method_names", [])) or 7
@@ -128,6 +124,7 @@ class RetinaFaceLargest:
         x1,y1,x2,y2 = [int(round(v)) for v in best.bbox]
         return x1,y1,x2,y2
 
+
 def mp_detect_all(bgr) -> List[Tuple[int,int,int,int,float]]:
     import mediapipe as mp
     H,W = bgr.shape[:2]
@@ -145,6 +142,7 @@ def mp_detect_all(bgr) -> List[Tuple[int,int,int,int,float]]:
             if x2 > x1 and y2 > y1: out.append((x1,y1,x2,y2,float(score)))
     return out
 
+
 def square_crop_from_bbox(bgr, bbox, scale: float=1.10):
     H,W = bgr.shape[:2]
     x1,y1,x2,y2 = bbox
@@ -154,6 +152,7 @@ def square_crop_from_bbox(bgr, bbox, scale: float=1.10):
     nx2 = min(W, int(round(cx+side/2))); ny2 = min(H, int(round(cy+side/2)))
     if nx2 <= nx1 or ny2 <= ny1: return None
     return bgr[ny1:ny2, nx1:nx2]
+
 
 def build_eval_transform(img_size: int):
     return transforms.Compose([
@@ -184,6 +183,7 @@ def iter_video_batches(video_path: str, batch_size: int):
     cap.release()
     return total, duration, batches
 
+
 def preprocess_face_batch(batch, detector_backend: str, device: torch.device,
                           tx, img_size: int, bbox_scale: float, retina_det: Optional[RetinaFaceLargest]):
     imgs = []; ok_flags=[]
@@ -210,9 +210,15 @@ def preprocess_face_batch(batch, detector_backend: str, device: torch.device,
 
 # ---------------- REAL eval ----------------
 @torch.no_grad()
-def eval_real_dir(model, device, img_size: int, in_root: Path, out_csv: str,
+def eval_real_dir(models: List[nn.Module], device: torch.device, img_size: int,
+                  in_root: Path, out_csv: str,
                   thr: float, batch_size: int, detector_backend: str,
-                  bbox_scale: float, fake_index: int, retina_det: Optional[RetinaFaceLargest]):
+                  bbox_scale: float, fake_index: int,
+                  retina_det: Optional[RetinaFaceLargest]):
+    """
+    Nếu len(models) == 1: dùng đúng model đó.
+    Nếu len(models)  > 1: ensemble bằng cách trung bình xác suất p_fake giữa các model.
+    """
     tx = build_eval_transform(img_size)
     rows = []
     for ds in [p for p in sorted(in_root.glob("*")) if p.is_dir()]:
@@ -226,11 +232,24 @@ def eval_real_dir(model, device, img_size: int, in_root: Path, out_csv: str,
                 for b in batches:
                     x, ok = preprocess_face_batch(b, detector_backend, device, tx, img_size, bbox_scale, retina_det)
                     x = x.to(device, non_blocking=True)
-                    log_bin, log_met, *_ = model(x)
-                    probs = torch.softmax(log_bin, dim=1)[:, fake_index]
+
+                    if len(models) == 1:
+                        log_bin, _, *_ = models[0](x)
+                        prob_bin = torch.softmax(log_bin, dim=1)
+                    else:
+                        prob_bins = []
+                        for m in models:
+                            log_bin, _, *_ = m(x)
+                            prob_bins.append(torch.softmax(log_bin, dim=1))
+                        prob_bin = torch.stack(prob_bins, dim=0).mean(dim=0)
+
+                    probs = prob_bin[:, fake_index]
+
                     for i, o in enumerate(ok):
                         if not o: continue
-                        if probs[i].item() >= thr: fake_cnt += 1
+                        if probs[i].item() >= thr:
+                            fake_cnt += 1
+
                 real_cnt = n_frames - fake_cnt
                 acc = real_cnt / max(1, n_frames)
                 rows.append([v.stem, n_frames, fake_cnt, real_cnt, round(duration,3), thr, round(acc,4), ds.name])
@@ -243,10 +262,16 @@ def eval_real_dir(model, device, img_size: int, in_root: Path, out_csv: str,
 
 # ---------------- FAKE eval ----------------
 @torch.no_grad()
-def eval_fake_dir(model, device, img_size: int, in_root: Path, out_csv: str,
+def eval_fake_dir(models: List[nn.Module], device: torch.device, img_size: int,
+                  in_root: Path, out_csv: str,
                   thr: float, batch_size: int, detector_backend: str,
                   bbox_scale: float, method_names: List[str], fake_index: int,
                   retina_det: Optional[RetinaFaceLargest]):
+    """
+    Ensemble:
+      - p_fake_ensemble = average_j softmax(log_bin_j)
+      - p_met_ensemble  = average_j softmax(log_met_j)
+    """
     tx = build_eval_transform(img_size)
     rows = []
     name2idx = {n: i for i, n in enumerate(method_names)}
@@ -263,16 +288,33 @@ def eval_fake_dir(model, device, img_size: int, in_root: Path, out_csv: str,
                 for b in batches:
                     x, ok = preprocess_face_batch(b, detector_backend, device, tx, img_size, bbox_scale, retina_det)
                     x = x.to(device, non_blocking=True)
-                    log_bin, log_met, *_ = model(x)
-                    probs  = torch.softmax(log_bin, dim=1)[:, fake_index]
-                    m_pred = torch.softmax(log_met, dim=1).argmax(1)
+
+                    if len(models) == 1:
+                        log_bin, log_met, *_ = models[0](x)
+                        prob_bin = torch.softmax(log_bin, dim=1)
+                        prob_met = torch.softmax(log_met, dim=1)
+                    else:
+                        prob_bins = []
+                        prob_mets = []
+                        for m in models:
+                            log_bin, log_met, *_ = m(x)
+                            prob_bins.append(torch.softmax(log_bin, dim=1))
+                            prob_mets.append(torch.softmax(log_met, dim=1))
+                        prob_bin = torch.stack(prob_bins, dim=0).mean(dim=0)
+                        prob_met = torch.stack(prob_mets, dim=0).mean(dim=0)
+
+                    probs  = prob_bin[:, fake_index]
+                    m_pred = prob_met.argmax(1)
+
                     for i, o in enumerate(ok):
                         if not o: continue
+                            # ensemble fake/real
                         p_fake = probs[i].item() >= thr
                         if p_fake:
                             fake_cnt += 1
                             if true_idx is not None and (m_pred[i].item() == true_idx):
                                 correct_m += 1
+
                 real_cnt = n_frames - fake_cnt
                 c_frames = correct_m
                 m_frames = max(0, fake_cnt - c_frames)
@@ -288,14 +330,16 @@ def eval_fake_dir(model, device, img_size: int, in_root: Path, out_csv: str,
 
 # ---------------- Main ----------------
 def main():
-    ap = argparse.ArgumentParser("Backend batch evaluator (mirror eval_videos_vit_facecrop.py)")
-    ap.add_argument("--root", type=str, required=True, help="data/videos_test")
-    ap.add_argument("--ckpt", type=str, required=True, help="detector_best.pt")
+    ap = argparse.ArgumentParser("Backend batch evaluator (mirror eval_videos_vit_facecrop.py) — now with ensemble support")
+    ap.add_argument("--root", type=str, required=True, help="data/videos_test (có real/ và fake/)")
+    ap.add_argument("--ckpt", type=str, required=True, nargs="+",
+                    help="1 hoặc nhiều detector_best.pt (ensemble nếu >=2)")
     ap.add_argument("--device", type=str, default="cuda")
-    ap.add_argument("--img_size", type=int, default=0, help="0 = lấy từ ckpt.meta.img_size")
+    ap.add_argument("--img_size", type=int, default=0, help="0 = lấy từ ckpt.meta.img_size (ckpt đầu tiên)")
     ap.add_argument("--model_name", type=str, default="", help="rỗng = lấy từ ckpt.meta.model_name/backbone_model")
     ap.add_argument("--batch", type=int, default=64, help="frame batch size")
-    ap.add_argument("--threshold", type=float, default=-1.0, help="<0 = dùng ckpt.meta.best_thr hoặc 0.5")
+    ap.add_argument("--threshold", type=float, default=-1.0,
+                    help="<0 = 1 model: dùng ckpt.meta.best_thr; >=2 model: dùng average(best_thr) (khuyến nghị: tự tune ensemble thr và truyền vào)")
     ap.add_argument("--bbox_scale", type=float, default=1.10, help="nới ô vuông quanh bbox (1.0 = tight)")
     ap.add_argument("--det_thr", type=float, default=0.5, help="ngưỡng RetinaFace")
     ap.add_argument("--fake_index", type=int, default=0, help="chỉ số lớp FAKE trong head nhị phân (0 hoặc 1)")
@@ -307,15 +351,38 @@ def main():
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model, meta = load_checkpoint_build_model(
-        ckpt_path=args.ckpt, device=device,
-        img_size_arg=(None if args.img_size <= 0 else args.img_size),
-        model_name_arg=(None if not args.model_name else args.model_name)
-    )
 
-    method_names = list(meta.get("method_names", []))
-    img_size = (args.img_size if args.img_size > 0 else meta.get("img_size", 384))
-    thr = args.threshold if args.threshold >= 0 else meta.get("best_thr", 0.5)
+    img_size_arg = None if args.img_size <= 0 else args.img_size
+    model_name_arg = None if not args.model_name else args.model_name
+
+    ckpt_paths: List[str] = args.ckpt
+    models: List[nn.Module] = []
+    metas: List[Dict] = []
+
+    for p in ckpt_paths:
+        m, meta = load_checkpoint_build_model(
+            ckpt_path=p,
+            device=device,
+            img_size_arg=img_size_arg,
+            model_name_arg=model_name_arg,
+        )
+        models.append(m)
+        metas.append(meta)
+        print(f"[INFO] Loaded ckpt: {p} | model={meta.get('model_name')} | img_size={meta.get('img_size')} | best_thr={meta.get('best_thr')}")
+
+    # phương pháp: lấy từ ckpt đầu tiên (giả định cùng schema)
+    method_names = list(metas[0].get("method_names", []))
+    img_size = (args.img_size if args.img_size > 0 else metas[0].get("img_size", 384))
+
+    if args.threshold >= 0:
+        thr = float(args.threshold)
+    else:
+        if len(metas) == 1:
+            thr = float(metas[0].get("best_thr", 0.5))
+        else:
+            # mặc định: trung bình best_thr các model (khuyến nghị: nên tự tune thr ensemble riêng)
+            thr = float(sum(m.get("best_thr", 0.5) for m in metas) / max(1, len(metas)))
+    print(f"[INFO] Using threshold={thr:.6f} | num_models={len(models)}")
 
     retina_det = None
     if args.detector_backend == "retinaface":
@@ -330,7 +397,7 @@ def main():
     fake_dir = root / "fake"
 
     if (not args.skip_real) and real_dir.is_dir():
-        eval_real_dir(model, device, img_size, real_dir, args.out_real, thr, args.batch,
+        eval_real_dir(models, device, img_size, real_dir, args.out_real, thr, args.batch,
                       detector_backend=args.detector_backend, bbox_scale=args.bbox_scale,
                       fake_index=args.fake_index, retina_det=retina_det)
         print(f"[DONE] Real -> {args.out_real}")
@@ -338,12 +405,13 @@ def main():
         print("[SKIP] Real evaluation skipped.")
 
     if (not args.skip_fake) and fake_dir.is_dir():
-        eval_fake_dir(model, device, img_size, fake_dir, args.out_fake, thr, args.batch,
+        eval_fake_dir(models, device, img_size, fake_dir, args.out_fake, thr, args.batch,
                       detector_backend=args.detector_backend, bbox_scale=args.bbox_scale,
                       method_names=method_names, fake_index=args.fake_index, retina_det=retina_det)
         print(f"[DONE] Fake -> {args.out_fake}")
     else:
         print("[SKIP] Fake evaluation skipped.")
+
 
 if __name__ == "__main__":
     main()
