@@ -12,11 +12,12 @@ import torch.nn as nn
 
 from .utils import draw_box_with_label_np, render_verdict_text
 from .face_detection import crop_largest_face
-from .xai_cam import generate_cam_vit, generate_cam_cnn, overlay_heatmap_on_bgr
+from .xai_cam import generate_cam_vit, generate_cam_cnn, generate_cam_swin, overlay_heatmap_on_bgr
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 ENSEMBLE_THR_DEFAULT = 0.55 
+
 
 def build_eval_transform(img_size: int):
     # exactly like backend_eval.py: ToPILImage() expects HxWxC array; we pass BGR array as-is
@@ -27,6 +28,7 @@ def build_eval_transform(img_size: int):
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
 
+
 @torch.no_grad()
 def _predict_image_tensor(x_chw: torch.Tensor, model, device):
     xb = x_chw.unsqueeze(0).to(device, non_blocking=True)
@@ -36,6 +38,7 @@ def _predict_image_tensor(x_chw: torch.Tensor, model, device):
     p_fake = float(pbin[0])
     p_real = float(pbin[1]) if pbin.shape[0] > 1 else float(1.0 - p_fake)
     return p_fake, p_real, pmth
+
 
 @torch.no_grad()
 def _ensemble_predict_bgr_crop(
@@ -59,6 +62,7 @@ def _ensemble_predict_bgr_crop(
         return p_fake_sum/n, p_real_sum/n, (pm_sum/n)
     else:
         return p_fake_sum/n, p_real_sum/n, np.zeros(1, dtype=np.float32)
+
 
 def _flush_bucket_with_cam(
     frames: List[dict],
@@ -107,12 +111,13 @@ def _flush_bucket_with_cam(
     except Exception:
         return
 
+
 def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
     """
     Cố gắng đoán layer conv cuối cùng để dùng cho Grad-CAM CNN.
     Ưu tiên:
       - ConvNeXt: backbone.stages[-1][-1]
-      - EfficientNet-like: backbone.blocks[-1] (hoặc phần tử cuối)
+      - EfficientNet-like: backbone.blocks[-2] (hook sớm hơn để map lan rộng hơn)
       - ResNet-like: layer4 / layers4 / block4 / stage4
       - Fallback: conv2d cuối cùng trong model
     """
@@ -133,7 +138,13 @@ def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
         try:
             blocks = backbone.blocks
             if hasattr(blocks, "__len__") and len(blocks) > 0:
-                last_block = blocks[-1]
+                cls_name = backbone.__class__.__name__.lower()
+                # EffNet: hook block sớm hơn một chút để tránh map chỉ ở rìa box
+                if "efficientnet" in cls_name and len(blocks) >= 2:
+                    idx = len(blocks) - 2
+                else:
+                    idx = len(blocks) - 1
+                last_block = blocks[idx]
                 if hasattr(last_block, "__len__") and len(last_block) > 0:
                     return last_block[-1]
                 return last_block
@@ -155,6 +166,7 @@ def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
             last_conv = m
     return last_conv
 
+
 def analyze_video(
     video_path: str,
     detectors_info: List[dict],
@@ -170,6 +182,8 @@ def analyze_video(
     # strict fallback control (match eval by default)
     allow_fallback: bool = False,
     xai_mode: str = "none",
+    # index của model được FE chọn để vẽ CAM (trong danh sách detectors_info)
+    xai_primary_index: Optional[int] = None,
 ):
     # ---------- choose threshold ----------
     if len(detectors_info) <= 0:
@@ -233,36 +247,45 @@ def analyze_video(
     xai_mode = (xai_mode or "none").lower()
     enable_xai = xai_mode in ("single", "full")
 
-    # ---------- chọn model cho Grad-CAM ----------
-    primary_info = None
+    primary_info: Optional[dict] = None
+    primary_model = None
+    primary_device = None
     is_vit = False
+    is_swin = False
     cnn_target_layer = None
 
-    # ƯU TIÊN: chọn ViT dựa trên tên backbone (model_name),
-    # tránh nhầm các CNN như EfficientNet có thuộc tính .blocks.
-    for info in detectors_info:
-        name = str(info.get("model_name", "")).lower()
-        if any(k in name for k in ["vit", "deit", "swin", "beit", "cait"]):
-            primary_info = info
+    if enable_xai and len(detectors_info) > 0:
+        # Nếu FE chọn model cụ thể cho XAI -> ưu tiên
+        if xai_primary_index is not None and 0 <= xai_primary_index < len(detectors_info):
+            primary_info = detectors_info[xai_primary_index]
+        else:
+            # fallback: ưu tiên Transformer (ViT / Swin) nếu có
+            for info in detectors_info:
+                arch_type = str(info.get("arch_type", "cnn"))
+                if arch_type in ("vit", "swin"):
+                    primary_info = info
+                    break
+            if primary_info is None:
+                primary_info = detectors_info[0]
+
+        primary_model = primary_info["model"]
+        primary_device = primary_info["device"]
+        arch_type = str(primary_info.get("arch_type", "cnn")).lower()
+
+        backbone = getattr(primary_model, "backbone", primary_model)
+        if arch_type == "vit":
             is_vit = True
-            break
-
-    # Nếu không có ViT nào → dùng model đầu tiên (CNN) và đoán target_layer để Grad-CAM
-    if primary_info is None and detectors_info:
-        primary_info = detectors_info[0]
-        backbone = getattr(primary_info["model"], "backbone", primary_info["model"])
-        cnn_target_layer = _guess_cnn_target_layer(backbone)
-        is_vit = False
-    elif primary_info is not None:
-        backbone = getattr(primary_info["model"], "backbone", primary_info["model"])
+        elif arch_type == "swin":
+            is_swin = True
+        else:
+            cnn_target_layer = _guess_cnn_target_layer(backbone)
     else:
-        # Không có model nào (phòng hờ) → tắt XAI
+        # tắt XAI, nhưng vẫn gán primary_model để code phía dưới không bị NameError
         enable_xai = False
-        primary_info = None
-        backbone = None
-
-    primary_model = primary_info["model"]
-    primary_device = primary_info["device"]
+        if len(detectors_info) > 0:
+            primary_info = detectors_info[0]
+            primary_model = primary_info["model"]
+            primary_device = primary_info["device"]
 
     while True:
         ok, frame_bgr = cap.read()
@@ -325,7 +348,7 @@ def analyze_video(
         )
         out_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
 
-        if enable_xai and crop_bgr is not None:
+        if enable_xai and crop_bgr is not None and primary_model is not None:
             try:
                 x = tx(crop_bgr)  # CHW
                 x = x.unsqueeze(0).to(primary_device, non_blocking=True)
@@ -335,6 +358,13 @@ def analyze_video(
 
                 if is_vit:
                     cam = generate_cam_vit(
+                        primary_model,
+                        x,
+                        target_index=target_idx,
+                        device=str(primary_device),
+                    )
+                elif is_swin:
+                    cam = generate_cam_swin(
                         primary_model,
                         x,
                         target_index=target_idx,
@@ -352,6 +382,7 @@ def analyze_video(
                     cam = None
 
                 if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
+                    # scale CAM theo p_fake để frame "fake chắc" nóng hơn
                     scale = float(pf)
                     scale = max(0.05, min(1.0, scale))
                     cam_scaled = cam * scale

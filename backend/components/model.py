@@ -10,6 +10,30 @@ from torchvision import transforms
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 
+
+def _infer_arch_family(model_name: str) -> str:
+    """
+    Suy ra 'family' kiến trúc từ tên backbone timm.
+    Ví dụ:
+      - Swin / SwinV2  -> 'swin'
+      - BEiT / ViT / DeiT / CaiT -> 'vit'
+      - MaxViT         -> 'maxvit'
+      - CoAtNet        -> 'coatnet'
+      - Còn lại        -> 'cnn'
+    """
+    n = model_name.lower()
+    if "swin" in n:
+        return "swin"
+    if "maxvit" in n:
+        return "maxvit"
+    if "coatnet" in n:
+        return "coatnet"
+    if any(k in n for k in ["vit", "deit", "beit", "cait"]):
+        # BEiT cũng xem như ViT-style cho Grad-CAM token-based
+        return "vit"
+    return "cnn"
+
+
 class MultiHeadViT(nn.Module):
     def __init__(self, model_name: str, img_size: int,
                  num_methods: int, num_face_classes: int, num_head_classes: int, num_full_classes: int,
@@ -51,6 +75,7 @@ class MultiHeadViT(nn.Module):
         f = self.backbone(x)
         return self.head_bin(f), self.head_met(f), self.head_face(f), self.head_head(f), self.head_full(f)
 
+
 def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
     sizes = {"num_methods": 0, "num_face_classes": 1, "num_head_classes": 1, "num_full_classes": 1}
     if "head_met.1.weight"  in ckpt_model_state: sizes["num_methods"]      = ckpt_model_state["head_met.1.weight"].shape[0]
@@ -59,8 +84,10 @@ def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor])
     if "head_full.1.weight" in ckpt_model_state: sizes["num_full_classes"] = ckpt_model_state["head_full.1.weight"].shape[0]
     return sizes
 
+
 def _filter_state_dict_by_shape(dst_state: Dict[str, torch.Tensor], src_state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     return {k: v for k, v in src_state.items() if k in dst_state and dst_state[k].shape == v.shape}
+
 
 def build_transform(img_size: int):
     return transforms.Compose([
@@ -68,6 +95,7 @@ def build_transform(img_size: int):
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
+
 
 def discover_checkpoints() -> List[str]:
     roots = [
@@ -84,6 +112,7 @@ def discover_checkpoints() -> List[str]:
                     found.append(os.path.join(dirpath, fn))
     found.sort()
     return found
+
 
 def load_single_detector(ckpt_path: str, device: torch.device):
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -116,7 +145,6 @@ def load_single_detector(ckpt_path: str, device: torch.device):
         )
     )
 
-
     model = MultiHeadViT(model_name, img_size, num_methods, num_face_classes, num_head_classes, num_full_classes).to(device)
     dst = model.state_dict()
     if ema_state:
@@ -128,6 +156,17 @@ def load_single_detector(ckpt_path: str, device: torch.device):
     tfm = build_transform(img_size)
     method_names = meta.get("method_names", [f"method_{i}" for i in range(num_methods)])
 
+    # ---- Nhận diện kiến trúc cho Grad-CAM / XAI ----
+    arch_family = _infer_arch_family(model_name)
+    # arch_type = nhóm cho Grad-CAM (vit / swin / cnn)
+    if arch_family == "swin":
+        arch_type = "swin"
+    elif arch_family == "vit":
+        arch_type = "vit"
+    else:
+        # MaxViT / CoAtNet / ConvNeXt / EffNet / ResNet... đều đi theo nhánh CNN-based
+        arch_type = "cnn"
+
     return {
         "model": model,
         "transform": tfm,
@@ -137,7 +176,10 @@ def load_single_detector(ckpt_path: str, device: torch.device):
         "best_thr": best_thr,
         "ckpt_path": ckpt_path,
         "model_name": model_name,
+        "arch_family": arch_family,
+        "arch_type": arch_type,
     }
+
 
 def load_multiple_detectors(ckpt_paths: List[str], device_name: Optional[str]=None):
     if device_name is None:

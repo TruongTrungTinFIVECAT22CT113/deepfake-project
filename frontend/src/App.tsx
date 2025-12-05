@@ -15,12 +15,14 @@ export default function App(): JSX.Element {
   );
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    try { localStorage.setItem("theme", theme); } catch {}
+    try {
+      localStorage.setItem("theme", theme);
+    } catch {}
   }, [theme]);
 
   // Backend models / health
   const [models, setModels] = useState<ModelMeta[]>([]);
-  const enabledIds = models.filter(m => m.enabled).map(m => m.id);
+  const enabledIds = models.filter((m) => m.enabled).map((m) => m.id);
   const [apiStatus, setApiStatus] = useState<string>("loading");
 
   useEffect(() => {
@@ -36,18 +38,22 @@ export default function App(): JSX.Element {
         setApiStatus("error");
       }
     })();
-    return () => { mounted = false; };
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   async function toggleModel(id: string, next: boolean) {
     const nextIds = next
       ? [...new Set([...enabledIds, id])]
-      : enabledIds.filter(x => x !== id);
+      : enabledIds.filter((x) => x !== id);
     if (nextIds.length < 1) return; // giữ ≥1 model bật
     try {
       const updated = await setModelsEnabled(nextIds);
       setModels(updated);
-    } catch {}
+    } catch {
+      // ignore
+    }
   }
 
   return (
@@ -56,10 +62,22 @@ export default function App(): JSX.Element {
         <div className="app-header-inner">
           <div className="title">Deepfake Detect</div>
           <div className="toolbar">
-            <span className="muted" style={{fontSize:12}}>Dark-first UI</span>
+            <span className="muted" style={{ fontSize: 12 }}>
+              Dark-first UI
+            </span>
             <div className="segmented" role="group" aria-label="Theme">
-              <button aria-pressed={theme === "dark"} onClick={() => setTheme("dark")}>Dark</button>
-              <button aria-pressed={theme === "light"} onClick={() => setTheme("light")}>Light</button>
+              <button
+                aria-pressed={theme === "dark"}
+                onClick={() => setTheme("dark")}
+              >
+                Dark
+              </button>
+              <button
+                aria-pressed={theme === "light"}
+                onClick={() => setTheme("light")}
+              >
+                Light
+              </button>
             </div>
           </div>
         </div>
@@ -74,14 +92,23 @@ export default function App(): JSX.Element {
 
           <section className="card stack">
             <div className="section-title">ANALYZE VIDEO</div>
-            <div className="muted" style={{fontSize:12}}>
+            <div className="muted" style={{ fontSize: 12 }}>
               API:&nbsp;
-              {apiStatus === "ok" ? <span className="pill success">OK</span> :
-               apiStatus === "loading" ? <span className="pill">Loading</span> :
-               <span className="pill danger">Error</span>}
+              {apiStatus === "ok" ? (
+                <span className="pill success">OK</span>
+              ) : apiStatus === "loading" ? (
+                <span className="pill">Loading</span>
+              ) : (
+                <span className="pill danger">Error</span>
+              )}
             </div>
 
-            <AnalyzerForm onResult={setRes} setLoading={setLoading} enabledIds={enabledIds} />
+            <AnalyzerForm
+              onResult={setRes}
+              setLoading={setLoading}
+              enabledIds={enabledIds}
+              models={models}          
+            />
 
             {loading && (
               <div className="loading-row">

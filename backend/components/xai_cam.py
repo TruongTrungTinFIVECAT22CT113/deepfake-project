@@ -61,7 +61,7 @@ def generate_cam_cnn(
     """
     Grad-CAM cho CNN:
       - target_layer: layer conv cuối cùng (vd model.layer4[-1] của ResNet)
-    Trả: cam [H,W] (tensor 0..1)
+    Trả: cam [H,W] (numpy 0..1)
     """
     model.eval()
     input_tensor = input_tensor.to(device)
@@ -216,3 +216,104 @@ def generate_cam_vit(
     # Chuẩn hoá 0..1 và trả về numpy
     cam_norm = _normalize_cam(cam_up)
     return cam_norm  # [H,W] float 0..1
+
+
+# ----------------- Swin GRAD-CAM -----------------
+
+def generate_cam_swin(
+    swin_model: nn.Module,
+    input_tensor: torch.Tensor,    # [1,3,H,W] normalized
+    target_index: int = 1,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Grad-CAM token-based cho Swin / SwinV2 timm:
+      - hook vào block cuối của stage cuối (backbone.layers[-1].blocks[-1])
+      - output block thường là [B, N, C] (N = h*w)
+      - reshape về lưới h x w rồi upsample lên H x W
+    """
+    swin_model.eval()
+    input_tensor = input_tensor.to(device)
+    backbone = getattr(swin_model, "backbone", swin_model)
+
+    if not hasattr(backbone, "layers"):
+        raise ValueError("Swin backbone không có thuộc tính .layers (mong đợi timm SwinTransformer).")
+
+    layers = backbone.layers
+    if not hasattr(layers, "__len__") or len(layers) == 0:
+        raise ValueError("Swin backbone.layers rỗng.")
+
+    last_stage = layers[-1]
+    blocks = getattr(last_stage, "blocks", None)
+    if blocks is None or (hasattr(blocks, "__len__") and len(blocks) == 0):
+        raise ValueError("Swin stage cuối không có blocks để hook Grad-CAM.")
+
+    last_block = blocks[-1]
+
+    feats: dict = {}
+    grads: dict = {}
+
+    def fwd_hook(module, inp, out):
+        # out: [B, N, C] hoặc [B, H, W, C]
+        feats["value"] = out
+
+    def bwd_hook(module, gin, gout):
+        grads["value"] = gout[0]
+
+    h1 = last_block.register_forward_hook(fwd_hook)
+    h2 = last_block.register_backward_hook(bwd_hook)
+
+    with torch.enable_grad():
+        x = input_tensor.clone().detach().to(device)
+        x.requires_grad_(True)
+
+        out = swin_model(x)
+        if isinstance(out, (list, tuple)):
+            logits_bin = out[0]
+        else:
+            logits_bin = out
+
+        score = logits_bin[0, target_index]
+        swin_model.zero_grad()
+        score.backward(retain_graph=False)
+
+    h1.remove()
+    h2.remove()
+
+    tokens = feats["value"]
+    grad_tokens = grads["value"]
+
+    if tokens.dim() == 4:
+        # [B, H_p, W_p, C]
+        B, H_p, W_p, C = tokens.shape
+        tokens = tokens.view(B, H_p * W_p, C)
+        grad_tokens = grad_tokens.view(B, H_p * W_p, C)
+        h_p, w_p = H_p, W_p
+    elif tokens.dim() == 3:
+        # [B, N, C] -> suy ra lưới vuông h_p x w_p
+        B, N, C = tokens.shape
+        h_p = int(N**0.5)
+        w_p = h_p
+        if h_p * w_p > N:
+            h_p = w_p = N
+        tokens = tokens[:, : h_p * w_p, :]
+        grad_tokens = grad_tokens[:, : h_p * w_p, :]
+    else:
+        raise ValueError(f"Shape output Swin block không hỗ trợ cho Grad-CAM: {tokens.shape}")
+
+    # weights: global avg over tokens
+    weights = grad_tokens.mean(dim=1, keepdim=True)          # [B,1,C]
+    cam_patch = torch.bmm(tokens, weights.transpose(1, 2))   # [B, N, 1]
+    cam_patch = cam_patch.view(1, 1, h_p, w_p)               # [1,1,h_p,w_p]
+    cam_patch = F.relu(cam_patch)
+
+    _, _, H, W = input_tensor.shape
+    cam_up = F.interpolate(
+        cam_patch,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    ).squeeze(0).squeeze(0)  # [H,W]
+
+    cam_norm = _normalize_cam(cam_up)
+    return cam_norm

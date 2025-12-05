@@ -3,7 +3,7 @@ export type Health = {
   methods?: string[];
   retinaface_available?: boolean;
   models?: ModelMeta[];
-  threshold_mode?: "single" | "average";
+  threshold_mode?: "single" | "ensemble";   // khớp backend
   threshold_default?: number | null;
 };
 
@@ -21,12 +21,15 @@ export type AnalyzeOptions = {
   bbox_scale?: number;   // 1.10 default
   thickness?: number;    // 3 default
   thr?: number | null;   // override, only effective when exactly 1 model is enabled
+
   // Basic
-  start_sec?: number;        // NEW
-  end_sec?: number;          // NEW
+  start_sec?: number;
+  end_sec?: number;
+
   // Models
   enabled_ids_csv?: string;
-  xai_mode?: string;
+  xai_mode?: "none" | "full";
+  xai_model_id?: string;
 };
 
 const API_BASE = "";
@@ -48,6 +51,11 @@ export async function listModels(): Promise<ModelMeta[]> {
   return await r.json();
 }
 
+/**
+ * Bật/tắt model.
+ * Backend route: POST /api/models/set-enabled
+ * Body: { enabled_ids: string[] }
+ */
 export async function setModelsEnabled(enabled_ids: string[]): Promise<ModelMeta[]> {
   const r = await fetch(`${API_BASE}/api/models/set-enabled`, {
     method: "POST",
@@ -70,7 +78,7 @@ export async function analyzeVideo(
   fd.append("bbox_scale", String(opts.bbox_scale ?? 1.10));
   fd.append("thickness", String(opts.thickness ?? 3));
 
-  // thr override: only send if number (frontend still sends; BE will ignore if >=2 models)
+  // thr override: chỉ gửi nếu là number; BE sẽ tự ignore nếu >= 2 model
   if (typeof opts.thr === "number" && !Number.isNaN(opts.thr)) {
     fd.append("thr", String(opts.thr));
   }
@@ -81,9 +89,13 @@ export async function analyzeVideo(
 
   // Models
   if (opts.enabled_ids_csv) fd.append("enabled_ids_csv", opts.enabled_ids_csv);
-  if (opts.xai_mode) fd.append("xai_mode", opts.xai_mode);
+  if (opts.xai_mode)        fd.append("xai_mode", opts.xai_mode);
+  if (opts.xai_model_id)    fd.append("xai_model_id", opts.xai_model_id);
 
-  const r = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: fd });
+  const r = await fetch(`${API_BASE}/api/analyze`, {
+    method: "POST",
+    body: fd,
+  });
   if (!r.ok) throw new Error(await r.text());
   return await r.json();
 }

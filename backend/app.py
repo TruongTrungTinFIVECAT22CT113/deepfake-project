@@ -25,6 +25,7 @@ _DETECTORS_INFO: List[dict] = []
 _MODELS_META: List[Dict[str, Any]] = []
 _METHOD_NAMES: List[str] | None = None
 
+
 def _clip_range(src_path: str, start_sec: float | None, end_sec: float | None) -> Optional[str]:
     """
     Trả về đường dẫn video tạm đã cắt theo [start_sec, end_sec].
@@ -83,6 +84,7 @@ def _clip_range(src_path: str, start_sec: float | None, end_sec: float | None) -
     except Exception:
         return None
 
+
 @app.on_event("startup")
 def _load_models():
     global _DETECTORS_INFO, _MODELS_META, _METHOD_NAMES
@@ -108,6 +110,7 @@ def _load_models():
             "schema": {"method_names": mnames, "img_size": int(info["img_size"])},
             "best_thr": float(info["best_thr"]),
         })
+
 
 @app.get("/api/health")
 def health():
@@ -142,9 +145,11 @@ def health():
         "threshold_default": thr_val,
     }
 
+
 @app.get("/api/models")
 def list_models():
     return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"], "best_thr": m["best_thr"]} for m in _MODELS_META]
+
 
 @app.post("/api/models/set-enabled")
 def set_models_enabled(payload: Dict[str, List[str]] = Body(...)):
@@ -157,6 +162,7 @@ def set_models_enabled(payload: Dict[str, List[str]] = Body(...)):
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
     return [{"id": m["id"], "name": m["name"], "enabled": m["enabled"], "schema": m["schema"], "best_thr": m["best_thr"]} for m in _MODELS_META]
 
+
 def _build_method_rows(counts: Dict[str, int], total_frames: int) -> List[Tuple[str, float]]:
     rows: List[Tuple[str, float]] = []
     if total_frames <= 0: return rows
@@ -164,6 +170,7 @@ def _build_method_rows(counts: Dict[str, int], total_frames: int) -> List[Tuple[
         rows.append((k, 100.0 * float(v) / float(total_frames)))
     rows.sort(key=lambda x: -x[1])
     return rows
+
 
 def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
     rows: List[Tuple[str, float]] = []
@@ -173,6 +180,7 @@ def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
         rows.append((k, 100.0 * float(v) / float(s)))
     rows.sort(key=lambda x: -x[1])
     return rows
+
 
 def _build_basic_explanation(
     method_rows_total: List[Tuple[str, float]],
@@ -201,6 +209,7 @@ def _build_basic_explanation(
         "artifacts": profile["artifacts"],
     }
 
+
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -211,6 +220,8 @@ async def analyze(
     start_sec: float | None = Form(None),   # NEW
     end_sec: float | None = Form(None),     # NEW
     xai_mode: str = Form("none"),
+    # ID model mà FE chọn để vẽ Grad-CAM (vd: "m1", "m2"...); phải thuộc nhóm enabled
+    xai_model_id: str | None = Form(None),
 ):
     if not _DETECTORS_INFO:
         return JSONResponse({"error":"Model chưa sẵn sàng"}, status_code=503)
@@ -220,6 +231,14 @@ async def analyze(
     if not enabled_idxs:
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
     chosen = [_DETECTORS_INFO[i] for i in enabled_idxs]
+
+    # map xai_model_id (id global) -> index trong danh sách chosen
+    xai_primary_index: Optional[int] = None
+    if xai_model_id:
+        for pos, global_idx in enumerate(enabled_idxs):
+            if _MODELS_META[global_idx]["id"] == xai_model_id:
+                xai_primary_index = pos
+                break
 
     # select threshold per rule
     fe_thr = float(thr) if (thr is not None and thr != "") else None
@@ -250,7 +269,8 @@ async def analyze(
             bbox_scale=float(bbox_scale),
             det_thr=0.5,
             box_thickness=int(thickness),
-            xai_mode=xai_mode,  # NEW
+            xai_mode=xai_mode,              # NEW
+            xai_primary_index=xai_primary_index,  # NEW
         )
 
         if not out_path:
@@ -313,6 +333,7 @@ async def analyze(
             except Exception:
                 pass
 
+
 @app.get("/api/download/{token}/{filename}")
 def download(token: str, filename: str):
     tmp_root = tempfile.gettempdir()
@@ -327,6 +348,7 @@ def download(token: str, filename: str):
     if not os.path.isfile(path):
         return JSONResponse({"error":"File không tồn tại."}, status_code=404)
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="127.0.0.1", port=8081, reload=True)
