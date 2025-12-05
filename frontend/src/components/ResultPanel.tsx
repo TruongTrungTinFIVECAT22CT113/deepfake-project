@@ -186,7 +186,7 @@ export default function ResultPanel(props: {
         <div className="muted">Detector used: <b>{r.detector_backend_used}</b></div>
       )}
       {r.thr_override_ignored && (
-        <div className="warn">Multiple models enabled → average threshold used (override ignored).</div>
+        <div className="warn">Multiple models enabled → ensemble threshold used (override ignored).</div>
       )}
 
       {/* Timeline per-frame */}

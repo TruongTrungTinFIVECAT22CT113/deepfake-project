@@ -11,9 +11,8 @@ import cv2
 import torch
 
 from components.model import load_multiple_detectors, discover_checkpoints
-from components.inference import analyze_video
+from components.inference import analyze_video, ENSEMBLE_THR_DEFAULT
 from components.face_detection import retinaface_available
-from components.utils import average_threshold
 from components.artifact_profiles import ARTIFACT_PROFILES
 
 app = FastAPI(title="Deepfake Detect API (Strict Pipeline)", version="2.0")
@@ -113,18 +112,32 @@ def _load_models():
 @app.get("/api/health")
 def health():
     if not _DETECTORS_INFO:
-        return JSONResponse({"status":"loading"}, status_code=503)
-    thr_mode = "single" if len([m for m in _MODELS_META if m["enabled"]]) == 1 else "average"
+        return JSONResponse({"status": "loading"}, status_code=503)
+
+    enabled_idxs = [i for i, m in enumerate(_MODELS_META) if m["enabled"]]
+    thr_mode = "single" if len(enabled_idxs) == 1 else "ensemble"
     thr_val = None
-    enabled_idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
+
     if enabled_idxs:
         infos = [_DETECTORS_INFO[i] for i in enabled_idxs]
-        thr_val = float(infos[0]["best_thr"]) if len(infos)==1 else average_threshold(infos)
+        if len(infos) == 1:
+            thr_val = float(infos[0]["best_thr"])
+        else:
+            thr_val = ENSEMBLE_THR_DEFAULT
+
     return {
-        "status":"ok",
+        "status": "ok",
         "methods": _METHOD_NAMES,
         "retinaface_available": retinaface_available(),
-        "models":[{"id":m["id"],"name":m["name"],"enabled":m["enabled"],"best_thr":m["best_thr"]} for m in _MODELS_META],
+        "models": [
+            {
+                "id": m["id"],
+                "name": m["name"],
+                "enabled": m["enabled"],
+                "best_thr": m["best_thr"],
+            }
+            for m in _MODELS_META
+        ],
         "threshold_mode": thr_mode,
         "threshold_default": thr_val,
     }
@@ -214,9 +227,8 @@ async def analyze(
         thr_used = float(fe_thr) if (fe_thr is not None) else float(chosen[0]["best_thr"])
         thr_override_ignored = False
     else:
-        thr_used = float(sum(ci["best_thr"] for ci in chosen) / len(chosen))
+        thr_used = ENSEMBLE_THR_DEFAULT
         thr_override_ignored = True
-
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(await file.read())
