@@ -16,7 +16,7 @@ from .xai_cam import generate_cam_vit, generate_cam_cnn, generate_cam_swin, over
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
-ENSEMBLE_THR_DEFAULT = 0.55 
+ENSEMBLE_THR_DEFAULT = 0.515 
 
 
 def build_eval_transform(img_size: int):
