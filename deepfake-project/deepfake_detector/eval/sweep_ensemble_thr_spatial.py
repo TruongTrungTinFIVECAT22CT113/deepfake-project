@@ -24,13 +24,12 @@ from torchvision import transforms
 from tqdm import tqdm
 
 # Import lại dataset/model/const từ train_spatial để nhất quán với lúc train
-from src.train_spatial import (
+from deepfake_detector.src.train_spatial import (
     MultiBranchDataset,
     MultiHeadViT,
     IMAGENET_MEAN,
     IMAGENET_STD,
 )  # :contentReference[oaicite:0]{index=0}
-
 
 # ----------------- Helpers đọc ckpt giống backend_eval -----------------
 def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
@@ -63,7 +62,17 @@ def load_checkpoint_build_model(
     - meta: dict chứa ít nhất: model_name, img_size, method_names, best_thr (nếu có)
     """
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    meta = ckpt.get("meta", {})
+    meta = ckpt.get("meta", {}).copy()
+
+    # ✅ lấy đúng threshold từ train_spatial
+    if "best_thr" not in meta:
+        if "best_thr" in ckpt:
+            meta["best_thr"] = ckpt["best_thr"]
+        elif "threshold" in meta:
+            meta["best_thr"] = meta["threshold"]
+        else:
+            meta["best_thr"] = 0.5
+
     model_state = ckpt.get("model", {})
     if not model_state:
         raise RuntimeError(f"Checkpoint thiếu key 'model': {ckpt_path}")
