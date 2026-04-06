@@ -328,6 +328,7 @@ def main():
     ap.add_argument("--fake_index", type=int, default=0, help="Chỉ số lớp FAKE trong head nhị phân (0 hoặc 1)")
 
     ap.add_argument("--out_json", type=str, default="", help="Nếu set, lưu kết quả res ra file JSON")
+    ap.add_argument("--out_json_each", action="store_true", help="Lưu val_thr.json riêng cho từng model cạnh checkpoint")
     args = ap.parse_args()
 
     # device
@@ -419,6 +420,35 @@ def main():
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(res, f, ensure_ascii=False, indent=2)
         print(f"[SAVE] Kết quả đã được lưu vào {args.out_json}")
+
+    # ── Chạy thêm từng model riêng lẻ nếu có --out_json_each ──
+    if args.out_json_each and len(models) > 1:
+        print("\n========== SWEEP TỪNG MODEL RIÊNG LẺ ==========")
+        for i, (single_model, single_meta, ckpt_path) in enumerate(zip(models, metas, ckpt_paths)):
+            model_label = single_meta.get("model_name", os.path.basename(os.path.dirname(os.path.dirname(ckpt_path))))
+            print(f"\n[{i+1}/{len(models)}] {model_label}")
+            res_single = evaluate_ensemble(
+                models=[single_model],
+                loader=dl_val,
+                device=device,
+                method_names=method_names,
+                thr_min=args.thr_min,
+                thr_max=args.thr_max,
+                thr_steps=args.thr_steps,
+                val_tta=args.val_tta,
+                val_repeat=args.val_repeat,
+                cons_bacc_min=args.cons_bacc_min,
+                cons_rec_real_min=args.cons_rec_real_min,
+                fake_index=args.fake_index,
+                phase_name=f"SINGLE_{model_label[:12]}",
+            )
+            # Lưu JSON cạnh checkpoint
+            out_dir = os.path.dirname(ckpt_path)
+            out_path = os.path.join(out_dir, "val_thr.json")
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(res_single, f, ensure_ascii=False, indent=2)
+            print(f"[SAVE] {out_path}")
+        print("=================================================")
 
 
 if __name__ == "__main__":

@@ -8,13 +8,16 @@ export default function ModelSelectorCard({
   models: ModelMeta[];
   onToggle: (id: string, next: boolean) => void;
 }) {
-  const enabledCount = models.filter(m => m.enabled).length;
+  const enabledCount = models.filter((m) => m.enabled).length;
 
   return (
     <div className="stack">
-      <div className="section-title">MODELS</div>
+      <div className="section-title">Mô hình</div>
+      <div className="help" style={{ marginTop: -8 }}>
+        Chọn các mô hình phát hiện sử dụng khi phân tích.
+      </div>
       <div className="model-list">
-        {models.map(m => {
+        {models.map((m) => {
           const onlyOneLeft = enabledCount === 1 && m.enabled;
           return (
             <label key={m.id} className="model-row">
@@ -24,13 +27,24 @@ export default function ModelSelectorCard({
                 disabled={onlyOneLeft}
                 onChange={(e) => onToggle(m.id, e.target.checked)}
               />
-              <span>{m.name}</span>
-              {onlyOneLeft && <em className="muted" style={{marginLeft:6}}>(required)</em>}
+              <span style={{ flex: 1 }}>{m.name}</span>
+              {onlyOneLeft && (
+                <em className="muted" style={{ fontSize: 11 }}>
+                  bắt buộc
+                </em>
+              )}
             </label>
           );
         })}
       </div>
-      <div className="help">Giữ bật ≥ 1 model.</div>
+      {models.length === 0 && (
+        <div className="muted" style={{ fontSize: 12, textAlign: "center", padding: "12px 0" }}>
+          Không có mô hình nào
+        </div>
+      )}
+      <div className="help">
+        Cần giữ bật ít nhất 1 mô hình.
+      </div>
     </div>
   );
 }

@@ -1,0 +1,27 @@
+{
+    "model_order": [
+        "BEiT-B",
+        "ConvNeXt-B",
+        "EfficientNet-B5",
+        "ResNet-RS152",
+        "ViT-B1K",
+        "ViT-B21K"
+    ],
+    "bin_weights": {
+        "BEiT-B":          0.9875,
+        "ConvNeXt-B":      0.9871,
+        "EfficientNet-B5": 1.0516,
+        "ResNet-RS152":    0.9890,
+        "ViT-B1K":         0.9911,
+        "ViT-B21K":        0.9937
+    },
+    "met_weights": {
+        "Audio2Animation": {"BEiT-B": 0.9521, "ConvNeXt-B": 1.1153, "EfficientNet-B5": 1.0889, "ResNet-RS152": 0.9026, "ViT-B1K": 1.0192, "ViT-B21K": 0.9219},
+        "Deepfakes":       {"BEiT-B": 1.0772, "ConvNeXt-B": 0.9698, "EfficientNet-B5": 1.0367, "ResNet-RS152": 0.9094, "ViT-B1K": 1.0181, "ViT-B21K": 0.9887},
+        "Face2Face":       {"BEiT-B": 1.0272, "ConvNeXt-B": 1.0006, "EfficientNet-B5": 1.0794, "ResNet-RS152": 1.0432, "ViT-B1K": 0.9049, "ViT-B21K": 0.9446},
+        "FaceShifter":     {"BEiT-B": 0.9517, "ConvNeXt-B": 1.0695, "EfficientNet-B5": 0.8786, "ResNet-RS152": 1.0997, "ViT-B1K": 0.9920, "ViT-B21K": 1.0086},
+        "FaceSwap":        {"BEiT-B": 1.0422, "ConvNeXt-B": 1.0159, "EfficientNet-B5": 1.0328, "ResNet-RS152": 0.9993, "ViT-B1K": 0.9952, "ViT-B21K": 0.9146},
+        "NeuralTextures":  {"BEiT-B": 0.9099, "ConvNeXt-B": 1.0026, "EfficientNet-B5": 1.0941, "ResNet-RS152": 0.9301, "ViT-B1K": 1.0499, "ViT-B21K": 1.0135},
+        "Video2VideoID":   {"BEiT-B": 1.0565, "ConvNeXt-B": 0.9445, "EfficientNet-B5": 1.0718, "ResNet-RS152": 1.0942, "ViT-B1K": 0.8641, "ViT-B21K": 0.9688}
+    }
+}

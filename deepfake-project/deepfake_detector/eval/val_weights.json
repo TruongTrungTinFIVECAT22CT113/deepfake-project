@@ -1,0 +1,76 @@
+{
+    "model_order": [
+        "BEiT-B",
+        "ConvNeXt-B",
+        "EfficientNet-B5",
+        "ResNet-RS152",
+        "ViT-B1K",
+        "ViT-B21K"
+    ],
+    "bin_weights": {
+        "BEiT-B": 0.995,
+        "ConvNeXt-B": 1.0056,
+        "EfficientNet-B5": 1.008,
+        "ResNet-RS152": 1.0081,
+        "ViT-B1K": 0.9886,
+        "ViT-B21K": 0.9947
+    },
+    "met_weights": {
+        "Audio2Animation": {
+            "BEiT-B": 1.0126,
+            "ConvNeXt-B": 1.038,
+            "EfficientNet-B5": 0.9652,
+            "ResNet-RS152": 1.0202,
+            "ViT-B1K": 0.9911,
+            "ViT-B21K": 0.9729
+        },
+        "Deepfakes": {
+            "BEiT-B": 1.0183,
+            "ConvNeXt-B": 0.9896,
+            "EfficientNet-B5": 1.0092,
+            "ResNet-RS152": 0.9644,
+            "ViT-B1K": 1.011,
+            "ViT-B21K": 1.0075
+        },
+        "Face2Face": {
+            "BEiT-B": 1.0074,
+            "ConvNeXt-B": 0.9983,
+            "EfficientNet-B5": 0.9997,
+            "ResNet-RS152": 1.0161,
+            "ViT-B1K": 0.991,
+            "ViT-B21K": 0.9874
+        },
+        "FaceShifter": {
+            "BEiT-B": 1.0019,
+            "ConvNeXt-B": 1.0093,
+            "EfficientNet-B5": 0.9886,
+            "ResNet-RS152": 1.0014,
+            "ViT-B1K": 0.9926,
+            "ViT-B21K": 1.0063
+        },
+        "FaceSwap": {
+            "BEiT-B": 1.0114,
+            "ConvNeXt-B": 1.0015,
+            "EfficientNet-B5": 1.0058,
+            "ResNet-RS152": 1.0037,
+            "ViT-B1K": 0.9988,
+            "ViT-B21K": 0.9788
+        },
+        "NeuralTextures": {
+            "BEiT-B": 0.9676,
+            "ConvNeXt-B": 0.9664,
+            "EfficientNet-B5": 0.9727,
+            "ResNet-RS152": 1.0411,
+            "ViT-B1K": 1.0381,
+            "ViT-B21K": 1.014
+        },
+        "Video2VideoID": {
+            "BEiT-B": 1.0001,
+            "ConvNeXt-B": 1.0117,
+            "EfficientNet-B5": 1.0132,
+            "ResNet-RS152": 1.0028,
+            "ViT-B1K": 0.9737,
+            "ViT-B21K": 0.9985
+        }
+    }
+}
