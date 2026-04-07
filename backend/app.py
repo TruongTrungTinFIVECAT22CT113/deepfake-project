@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, tempfile
+import os, tempfile, pathlib
 from typing import List, Dict, Any, Optional, Tuple
 
-from fastapi import FastAPI, File, UploadFile, Form, Body
+from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import cv2
@@ -21,6 +22,13 @@ app.add_middleware(
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
+# ── Serve frontend/dist nếu đã build ──────────────────────────────────────────
+_DIST = pathlib.Path(__file__).parent.parent / "frontend" / "dist"
+
+if _DIST.exists():
+    app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+
+# ── State toàn cục ────────────────────────────────────────────────────────────
 _DETECTORS_INFO: List[dict] = []
 _MODELS_META: List[Dict[str, Any]] = []
 _METHOD_NAMES: List[str] | None = None
@@ -49,7 +57,6 @@ def _clip_range(src_path: str, start_sec: float | None, end_sec: float | None) -
             return None
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
-        # chuyển sang frame index
         start_f = 0 if not start_sec or start_sec < 0 else int(start_sec * fps + 0.5)
         end_f = total_frames if (end_sec is None or end_sec < 0) else int(end_sec * fps + 0.5)
         start_f = max(0, min(start_f, total_frames))
@@ -58,7 +65,6 @@ def _clip_range(src_path: str, start_sec: float | None, end_sec: float | None) -
             cap.release()
             return None
 
-        # seek tới start_f
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_f)
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -187,8 +193,6 @@ def _build_basic_explanation(
     method_rows_fake: List[Tuple[str, float]],
     fake_ratio: float,
 ) -> Optional[Dict[str, Any]]:
-    # Nếu real chiếm áp đảo, không cần giải thích chi tiết
-    # 0.5 = ít nhất 50% frame bị phát hiện giả mới giải thích
     if fake_ratio < 0.75:
         return None
 
@@ -217,22 +221,19 @@ async def analyze(
     bbox_scale: float = Form(1.10),
     thr: float | None = Form(None),
     thickness: int = Form(3),
-    start_sec: float | None = Form(None),   # NEW
-    end_sec: float | None = Form(None),     # NEW
+    start_sec: float | None = Form(None),
+    end_sec: float | None = Form(None),
     xai_mode: str = Form("none"),
-    # ID model mà FE chọn để vẽ Grad-CAM (vd: "m1", "m2"...); phải thuộc nhóm enabled
     xai_model_id: str | None = Form(None),
 ):
     if not _DETECTORS_INFO:
         return JSONResponse({"error":"Model chưa sẵn sàng"}, status_code=503)
 
-    # choose enabled models
     enabled_idxs = [i for i,m in enumerate(_MODELS_META) if m["enabled"]]
     if not enabled_idxs:
         return JSONResponse({"error":"Phải bật ≥ 1 model."}, status_code=400)
     chosen = [_DETECTORS_INFO[i] for i in enabled_idxs]
 
-    # map xai_model_id (id global) -> index trong danh sách chosen
     xai_primary_index: Optional[int] = None
     if xai_model_id:
         for pos, global_idx in enumerate(enabled_idxs):
@@ -240,7 +241,6 @@ async def analyze(
                 xai_primary_index = pos
                 break
 
-    # select threshold per rule
     fe_thr = float(thr) if (thr is not None and thr != "") else None
     if len(chosen) == 1:
         thr_used = float(fe_thr) if (fe_thr is not None) else float(chosen[0]["best_thr"])
@@ -248,6 +248,7 @@ async def analyze(
     else:
         thr_used = ENSEMBLE_THR_DEFAULT
         thr_override_ignored = True
+
     suffix = os.path.splitext(file.filename or "")[1] or ".mp4"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(await file.read())
@@ -269,16 +270,15 @@ async def analyze(
             bbox_scale=float(bbox_scale),
             det_thr=0.5,
             box_thickness=int(thickness),
-            xai_mode=xai_mode,              # NEW
-            xai_primary_index=xai_primary_index,  # NEW
+            xai_mode=xai_mode,
+            xai_primary_index=xai_primary_index,
         )
 
         if not out_path:
             return JSONResponse({"error": verdict or "Phân tích thất bại."}, status_code=400)
-        if (not out_path) or (not os.path.isfile(out_path)):
+        if not os.path.isfile(out_path):
             return JSONResponse({"error": verdict or "Không tạo được video kết quả."}, status_code=500)
 
-        # ---- Build both tables from counts to avoid ambiguity ----
         frames_total = int(stats.get("frames_total", 0))
         fake_frames  = int(stats.get("fake_frames", 0))
         counts: Dict[str, int] = {k: int(v) for k, v in (stats.get("method_distribution") or {}).items()}
@@ -286,22 +286,15 @@ async def analyze(
         method_rows_total = _build_method_rows(counts, frames_total)
         method_rows_fake  = _build_method_rows_fake(counts)
         fake_ratio = float(stats.get("fake_ratio", 0.0))
-        explanation_basic = _build_basic_explanation(
-            method_rows_total,
-            method_rows_fake,
-            fake_ratio,
-        )
+        explanation_basic = _build_basic_explanation(method_rows_total, method_rows_fake, fake_ratio)
 
         token = os.path.basename(os.path.dirname(out_path))
         fname = "result.mp4"
         final_path = os.path.join(os.path.dirname(out_path), fname)
         if out_path != final_path:
-            try:
-                os.replace(out_path, final_path)
-            except Exception:
-                pass
+            try: os.replace(out_path, final_path)
+            except Exception: pass
 
-        # legacy 'method_rows' -> default to TOTAL (clearer)
         return {
             "verdict": verdict,
             "video_url": f"/api/download/{token}/{fname}",
@@ -315,7 +308,7 @@ async def analyze(
             "detector_backend_used": stats.get("detector_backend_used"),
             "method_rows_total": method_rows_total,
             "method_rows_fake": method_rows_fake,
-            "method_rows": method_rows_total,  # legacy
+            "method_rows": method_rows_total,
             "method_distribution": counts,
             "frame_tags": stats.get("frame_tags", []),
             "analyzed_start_sec": start_used if clip_path else None,
@@ -323,15 +316,11 @@ async def analyze(
             "explanation_basic": explanation_basic,
         }
     finally:
-        try:
-            os.remove(src_path)
-        except Exception:
-            pass
+        try: os.remove(src_path)
+        except Exception: pass
         if clip_path:
-            try:
-                os.remove(clip_path)
-            except Exception:
-                pass
+            try: os.remove(clip_path)
+            except Exception: pass
 
 
 @app.get("/api/download/{token}/{filename}")
@@ -348,6 +337,17 @@ def download(token: str, filename: str):
     if not os.path.isfile(path):
         return JSONResponse({"error":"File không tồn tại."}, status_code=404)
     return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
+# ── SPA fallback — PHẢI đặt CUỐI CÙNG, sau tất cả /api/* routes ──────────────
+if _DIST.exists():
+    @app.get("/")
+    def _root():
+        return FileResponse(_DIST / "index.html")
+
+    @app.get("/{full_path:path}")
+    def _spa_fallback(full_path: str):
+        return FileResponse(_DIST / "index.html")
 
 
 if __name__ == "__main__":

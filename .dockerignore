@@ -1,0 +1,11 @@
+deepfake-project/
+frontend/node_modules/
+frontend/.vite/
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

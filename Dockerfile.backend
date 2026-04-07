@@ -1,0 +1,49 @@
+# ============================================================
+# Backend Dockerfile — Deepfake Detector (GPU)
+# Base image: CUDA 12.4 + cuDNN — khớp với requirements_gpu.txt
+# ============================================================
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Cài Python 3.11 + các thư viện hệ thống
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-dev \
+    python3-pip \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    ffmpeg \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# Đặt python3.11 làm mặc định
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python3
+
+WORKDIR /app
+
+# Copy requirements
+COPY requirements_gpu_linux.txt ./requirements_gpu_linux.txt
+COPY backend/requirements.txt  ./requirements_backend.txt
+
+# Cài PyTorch GPU + thư viện AI
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements_gpu_linux.txt
+
+# Cài FastAPI + uvicorn
+RUN pip install --no-cache-dir -r requirements_backend.txt
+
+# Copy source code backend
+COPY backend/ ./backend/
+
+# Copy frontend đã build
+COPY frontend/dist/ ./frontend/dist/
+
+EXPOSE 8081
+
+WORKDIR /app/backend
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081"]

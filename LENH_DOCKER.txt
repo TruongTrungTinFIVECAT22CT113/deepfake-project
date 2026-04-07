@@ -1,0 +1,4 @@
+docker compose build — build lại image khi sửa code
+docker compose up — chạy app
+.\build_release.ps1 — build + đóng gói gửi người khác
+.\build_release.ps1 -SkipBuild — chỉ đóng gói, không build lại

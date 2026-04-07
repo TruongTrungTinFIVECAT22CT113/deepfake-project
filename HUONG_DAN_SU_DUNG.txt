@@ -1,0 +1,88 @@
+u dung · TXT
+Copy
+
+╔══════════════════════════════════════════════════════════════════╗
+║           DEEPFAKE DETECTOR — HƯỚNG DẪN SỬ DỤNG               ║
+║           Dành cho người nhận file ZIP                          ║
+╚══════════════════════════════════════════════════════════════════╝
+ 
+YÊU CẦU MÁY TÍNH
+─────────────────
+  • Windows 10 hoặc Windows 11 (64-bit)
+  • RAM tối thiểu 8GB (khuyến nghị 16GB)
+  • Dung lượng ổ cứng trống: tối thiểu 10GB
+  • Card đồ họa NVIDIA (khuyến nghị để phân tích nhanh hơn)
+  • Kết nối Internet (chỉ cần cho lần chạy đầu tiên)
+ 
+ 
+════════════════════════════════════════════════════════════════════
+BƯỚC 1 — CÀI DOCKER DESKTOP (chỉ làm 1 lần duy nhất)
+════════════════════════════════════════════════════════════════════
+ 
+1. Mở trình duyệt, truy cập:
+   https://www.docker.com/products/docker-desktop/
+ 
+2. Nhấn "Download for Windows" → tải file .exe về
+ 
+3. Chạy file .exe vừa tải, nhấn Next/Accept cho đến khi xong
+ 
+4. Khởi động lại máy tính nếu được yêu cầu
+ 
+5. Sau khi khởi động lại, mở Docker Desktop từ Start Menu
+   → Chờ vài giây đến khi thấy chữ "Engine running" ở góc dưới trái
+   → Màu xanh lá = đang chạy tốt ✓
+ 
+ 
+════════════════════════════════════════════════════════════════════
+BƯỚC 2 — GIẢI NÉN FILE ZIP
+════════════════════════════════════════════════════════════════════
+ 
+1. Tìm file ZIP vừa nhận được (tên dạng: deepfake-detector_2025-xx-xx.zip)
+ 
+2. Chuột phải vào file ZIP → chọn "Extract All..." (Giải nén tất cả)
+ 
+3. Chọn nơi lưu, ví dụ: C:\deepfake-detector\
+   (Tránh đặt trong thư mục có tên tiếng Việt hoặc có dấu cách)
+ 
+4. Nhấn "Extract"
+ 
+5. Sau khi giải nén, mở thư mục ra — bên trong phải có các file sau:
+   ├── Dockerfile.backend
+   ├── docker-compose.yml
+   ├── .dockerignore
+   ├── requirements_gpu_linux.txt
+   ├── HUONG_DAN.txt
+   ├── backend\
+   └── frontend\
+ 
+ 
+════════════════════════════════════════════════════════════════════
+BƯỚC 3 — CHẠY ỨNG DỤNG LẦN ĐẦU TIÊN
+════════════════════════════════════════════════════════════════════
+ 
+  ⚠ Lần đầu tiên sẽ mất 10–20 phút vì cần tải thư viện AI (~3GB)
+  ⚠ Đảm bảo máy đang kết nối Internet
+ 
+1. Mở PowerShell:
+   → Nhấn phím Windows → gõ "PowerShell" → nhấn Enter
+ 
+2. Gõ lệnh sau để vào thư mục vừa giải nén
+   (thay đường dẫn nếu bạn giải nén ở chỗ khác):
+ 
+   cd C:\deepfake-detector
+ 
+3. Gõ lệnh để chạy ứng dụng:
+ 
+   docker compose up
+ 
+4. Màn hình sẽ hiện rất nhiều chữ đang tải xuống — đây là bình thường
+   Chờ đến khi thấy dòng:
+ 
+   INFO:     Application startup complete.
+ 
+5. Mở trình duyệt (Chrome, Edge, Firefox...) và truy cập:
+ 
+   http://localhost:8081
+ 
+   → Giao diện Deepfake Detector sẽ hiện ra ✓
+ 
