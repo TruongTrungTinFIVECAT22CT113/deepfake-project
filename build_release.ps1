@@ -83,13 +83,45 @@ Set-Location $ROOT
 if (Test-Path $RELEASE_DIR) { Remove-Item $RELEASE_DIR -Recurse -Force }
 New-Item -ItemType Directory -Path $RELEASE_DIR | Out-Null
 
-Log-Info "Copy file cau hinh..."
-foreach ($f in @("docker-compose.yml", "HUONG_DAN_SU_DUNG.txt")) {
-    $src = Join-Path $ROOT $f
-    if (Test-Path $src) { Copy-Item $src $RELEASE_DIR; Log-Info "  + $f" }
-    else { Log-Error "Khong tim thay $f"; exit 1 }
-}
+# Tao docker-compose.yml dung cho nguoi nhan
+# Chi dung image co san, KHONG co phan build:
+Log-Info "Tao docker-compose.yml cho nguoi nhan..."
+$composeContent = @"
+services:
+  backend:
+    image: deepfake-project-backend:latest
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./backend/models:/app/backend/models:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+"@
+$composeContent | Out-File -FilePath (Join-Path $RELEASE_DIR "docker-compose.yml") -Encoding UTF8
+Log-Info "  + docker-compose.yml (phien ban nguoi dung)"
 
+# Copy huong dan
+$src = Join-Path $ROOT "HUONG_DAN_SU_DUNG.txt"
+if (Test-Path $src) { Copy-Item $src $RELEASE_DIR; Log-Info "  + HUONG_DAN_SU_DUNG.txt" }
+else { Log-Error "Khong tim thay HUONG_DAN_SU_DUNG.txt"; exit 1 }
+
+# Copy backend/models
 Log-Info "Copy backend/models/..."
 $modelsSrc  = Join-Path $BACKEND "models"
 $modelsDest = Join-Path $RELEASE_DIR "backend\models"
@@ -101,13 +133,14 @@ if (Test-Path $modelsSrc) {
     Log-Info "Khong co thu muc backend/models/, bo qua"
 }
 
+# Copy frontend/dist
 Log-Info "Copy frontend/dist/..."
 $frontendDest = Join-Path $RELEASE_DIR "frontend\dist"
 New-Item -ItemType Directory -Path $frontendDest | Out-Null
 Copy-Item (Join-Path $DIST "*") $frontendDest -Recurse
 Log-OK "Frontend dist copied"
 
-# Buoc 4: Export Docker image ra file .tar
+# Buoc 4: Export Docker image
 Log-Step "Buoc 4/5: Export Docker image ra file .tar (~13GB, mat vai phut)"
 Log-Info "Dang export image: $IMAGE_NAME"
 Log-Info "Vui long cho, khong tat terminal..."
@@ -116,8 +149,8 @@ if ($LASTEXITCODE -ne 0) { Log-Error "docker save that bai"; exit 1 }
 $tarSize = [math]::Round((Get-Item $TAR_PATH).Length / 1GB, 2)
 Log-OK "Export xong: deepfake-image.tar ($tarSize GB)"
 
-# Buoc 5: Nen ZIP bang 7-Zip (ho tro file lon hon 2GB)
-Log-Step "Buoc 5/5: Nen thanh file ZIP bang 7-Zip (mat vai phut)"
+# Buoc 5: Nen ZIP bang 7-Zip
+Log-Step "Buoc 5/5: Nen thanh file ZIP bang 7-Zip"
 
 if (Test-Path $ZIP_PATH) { Remove-Item $ZIP_PATH -Force }
 Log-Info "Dang nen..."
