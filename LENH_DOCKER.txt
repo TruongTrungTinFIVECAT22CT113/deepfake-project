@@ -1,4 +1,64 @@
-docker compose build — build lại image khi sửa code
-docker compose up — chạy app
-.\build_release.ps1 — build + đóng gói gửi người khác
-.\build_release.ps1 -SkipBuild — chỉ đóng gói, không build lại
+══════════════════════════════════════════════════
+  LỆNH DOCKER — DEEPFAKE DETECTOR
+══════════════════════════════════════════════════
+
+── PHÁT TRIỂN (chạy trên máy dev) ───────────────
+
+docker compose build
+  → Build lại image sau khi sửa code
+
+docker compose up
+  → Chạy ứng dụng, mở trình duyệt: http://localhost:8081
+
+docker compose down
+  → Dừng ứng dụng
+
+
+── ĐÓNG GÓI & PHÁT HÀNH ─────────────────────────
+
+.\build_release.ps1
+  → Build frontend + Build Docker + Push lên Docker Hub
+
+.\build_release.ps1 -SkipBuild
+  → Chỉ Push lên Docker Hub, bỏ qua build (khi code không đổi)
+
+
+── DOCKER HUB (cập nhật image cho người dùng) ───
+
+docker login
+  → Đăng nhập Docker Hub
+
+docker tag deepfake-project-backend:latest nobu213/deepfake:latest
+  → Gắn tag chuẩn bị push
+
+docker push nobu213/deepfake:latest
+  → Push image lên Docker Hub
+
+
+── NGƯỜI DÙNG CUỐI (máy nhận) ───────────────────
+
+docker pull nobu213/deepfake:latest
+  → Tải image về (~13GB, chỉ làm 1 lần)
+
+docker tag nobu213/deepfake:latest deepfake-project-backend:latest
+  → Đặt tên image đúng chuẩn
+
+docker compose up
+  → Chạy ứng dụng → mở http://localhost:8081
+
+
+── XỬ LÝ SỰ CỐ ──────────────────────────────────
+
+docker ps -a
+  → Xem tất cả container đang chạy
+
+docker stop $(docker ps -q)
+  → Dừng tất cả container
+
+docker rm -f deepfake_backend
+  → Xóa container bị conflict tên
+
+docker image prune -a
+  → Xóa toàn bộ image không dùng (dọn dẹp ổ cứng)
+
+══════════════════════════════════════════════════

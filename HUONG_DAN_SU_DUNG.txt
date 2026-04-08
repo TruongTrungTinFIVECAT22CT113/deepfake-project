@@ -1,88 +1,151 @@
-u dung · TXT
-Copy
-
 ╔══════════════════════════════════════════════════════════════════╗
 ║           DEEPFAKE DETECTOR — HƯỚNG DẪN SỬ DỤNG               ║
-║           Dành cho người nhận file ZIP                          ║
 ╚══════════════════════════════════════════════════════════════════╝
- 
+
 YÊU CẦU MÁY TÍNH
 ─────────────────
   • Windows 10 hoặc Windows 11 (64-bit)
   • RAM tối thiểu 8GB (khuyến nghị 16GB)
-  • Dung lượng ổ cứng trống: tối thiểu 10GB
+  • Dung lượng ổ cứng trống: tối thiểu 20GB
   • Card đồ họa NVIDIA (khuyến nghị để phân tích nhanh hơn)
-  • Kết nối Internet (chỉ cần cho lần chạy đầu tiên)
- 
- 
+  • Kết nối Internet (để tải ứng dụng lần đầu ~13GB)
+
+
 ════════════════════════════════════════════════════════════════════
 BƯỚC 1 — CÀI DOCKER DESKTOP (chỉ làm 1 lần duy nhất)
 ════════════════════════════════════════════════════════════════════
- 
+
 1. Mở trình duyệt, truy cập:
    https://www.docker.com/products/docker-desktop/
- 
+
 2. Nhấn "Download for Windows" → tải file .exe về
- 
+
 3. Chạy file .exe vừa tải, nhấn Next/Accept cho đến khi xong
- 
+
 4. Khởi động lại máy tính nếu được yêu cầu
- 
+
 5. Sau khi khởi động lại, mở Docker Desktop từ Start Menu
    → Chờ vài giây đến khi thấy chữ "Engine running" ở góc dưới trái
    → Màu xanh lá = đang chạy tốt ✓
- 
- 
+
+6. (Khuyến nghị) Đổi thư mục lưu Docker sang ổ D: để tránh đầy ổ C:
+   → Docker Desktop → Settings → Resources → Advanced
+   → Disk image location: đổi sang D:\Docker\data
+   → Nhấn Apply & Restart
+
+
 ════════════════════════════════════════════════════════════════════
-BƯỚC 2 — GIẢI NÉN FILE ZIP
+BƯỚC 2 — TẠO THƯ MỤC VÀ LƯU FILE CẤU HÌNH
 ════════════════════════════════════════════════════════════════════
- 
-1. Tìm file ZIP vừa nhận được (tên dạng: deepfake-detector_2025-xx-xx.zip)
- 
-2. Chuột phải vào file ZIP → chọn "Extract All..." (Giải nén tất cả)
- 
-3. Chọn nơi lưu, ví dụ: C:\deepfake-detector\
+
+1. Tạo thư mục để chứa ứng dụng, ví dụ: D:\Docker\Deepfake\
    (Tránh đặt trong thư mục có tên tiếng Việt hoặc có dấu cách)
- 
-4. Nhấn "Extract"
- 
-5. Sau khi giải nén, mở thư mục ra — bên trong phải có các file sau:
-   ├── Dockerfile.backend
-   ├── docker-compose.yml
-   ├── .dockerignore
-   ├── requirements_gpu_linux.txt
-   ├── HUONG_DAN.txt
-   ├── backend\
-   └── frontend\
- 
- 
+
+2. Copy file docker-compose.yml (đính kèm cùng hướng dẫn này)
+   vào thư mục vừa tạo
+
+
 ════════════════════════════════════════════════════════════════════
-BƯỚC 3 — CHẠY ỨNG DỤNG LẦN ĐẦU TIÊN
+BƯỚC 3 — TẢI ỨNG DỤNG VỀ MÁY (chỉ làm 1 lần, mất 30-60 phút)
 ════════════════════════════════════════════════════════════════════
- 
-  ⚠ Lần đầu tiên sẽ mất 10–20 phút vì cần tải thư viện AI (~3GB)
-  ⚠ Đảm bảo máy đang kết nối Internet
- 
+
+  ⚠ Lần đầu tiên sẽ tải ~13GB — đảm bảo có đủ dung lượng và mạng ổn định
+
 1. Mở PowerShell:
    → Nhấn phím Windows → gõ "PowerShell" → nhấn Enter
- 
-2. Gõ lệnh sau để vào thư mục vừa giải nén
-   (thay đường dẫn nếu bạn giải nén ở chỗ khác):
- 
-   cd C:\deepfake-detector
- 
-3. Gõ lệnh để chạy ứng dụng:
- 
+
+2. Chạy lần lượt 2 lệnh sau:
+
+   docker pull nobu213/deepfake:latest
+
+   docker tag nobu213/deepfake:latest deepfake-project-backend:latest
+
+3. Chờ tải xong — màn hình hiện:
+   Status: Downloaded newer image for nobu213/deepfake:latest
+
+
+════════════════════════════════════════════════════════════════════
+BƯỚC 4 — CHẠY ỨNG DỤNG
+════════════════════════════════════════════════════════════════════
+
+1. Mở PowerShell
+
+2. Vào thư mục chứa docker-compose.yml:
+
+   cd D:\Docker\Deepfake
+
+3. Chạy lệnh:
+
    docker compose up
- 
-4. Màn hình sẽ hiện rất nhiều chữ đang tải xuống — đây là bình thường
-   Chờ đến khi thấy dòng:
- 
+
+4. Chờ khoảng 1-2 phút đến khi thấy dòng:
+
    INFO:     Application startup complete.
- 
+
 5. Mở trình duyệt (Chrome, Edge, Firefox...) và truy cập:
- 
+
    http://localhost:8081
- 
+
    → Giao diện Deepfake Detector sẽ hiện ra ✓
- 
+
+
+════════════════════════════════════════════════════════════════════
+CÁC LẦN CHẠY SAU (chỉ mất 30 giây)
+════════════════════════════════════════════════════════════════════
+
+1. Mở Docker Desktop → chờ "Engine running"
+
+2. Mở PowerShell:
+
+   cd D:\Docker\Deepfake
+   docker compose up
+
+3. Mở trình duyệt: http://localhost:8081
+
+
+════════════════════════════════════════════════════════════════════
+DỪNG ỨNG DỤNG KHI DÙNG XONG
+════════════════════════════════════════════════════════════════════
+
+Quay lại cửa sổ PowerShell đang chạy → nhấn tổ hợp phím:
+
+   Ctrl + C
+
+Hoặc mở PowerShell mới và gõ:
+
+   cd D:\Docker\Deepfake
+   docker compose down
+
+
+════════════════════════════════════════════════════════════════════
+XỬ LÝ SỰ CỐ THƯỜNG GẶP
+════════════════════════════════════════════════════════════════════
+
+❌ "docker: command not found" hoặc "'docker' is not recognized"
+   → Docker Desktop chưa được mở
+   → Giải pháp: Mở Docker Desktop, chờ "Engine running" rồi thử lại
+
+❌ Lỗi "port 8081 already in use"
+   → Chạy: docker compose down
+   → Rồi chạy lại: docker compose up
+
+❌ Mở http://localhost:8081 nhưng không thấy gì
+   → Chờ thêm 1-2 phút rồi nhấn F5 làm mới trang
+
+❌ Lỗi khi phân tích video
+   → Thử dùng video định dạng MP4
+   → Thử chọn bộ phát hiện "MediaPipe (CPU)" thay vì "RetinaFace (GPU)"
+
+❌ Ứng dụng chạy rất chậm
+   → Máy không có GPU NVIDIA → chạy bằng CPU sẽ chậm hơn, đây là bình thường
+
+
+════════════════════════════════════════════════════════════════════
+LƯU Ý QUAN TRỌNG
+════════════════════════════════════════════════════════════════════
+
+  ⚠ Kết quả phân tích chỉ mang tính THAM KHẢO
+  ⚠ Không thay thế giám định chuyên môn
+  ⚠ Độ chính xác phụ thuộc vào chất lượng video đầu vào
+
+════════════════════════════════════════════════════════════════════
