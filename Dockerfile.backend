@@ -37,7 +37,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Cài FastAPI + uvicorn
 RUN pip install --no-cache-dir -r requirements_backend.txt
 
-# Copy source code backend
+# Copy source code backend (bao gom ca models/ ben trong)
 COPY backend/ ./backend/
 
 # Copy frontend đã build
