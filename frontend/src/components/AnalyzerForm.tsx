@@ -186,7 +186,7 @@ export default function AnalyzerForm({
                 <input type="number" min={0} step={0.1} placeholder="Kết thúc (s)" value={endTime}
                   onChange={(e) => setEndTime(e.target.value)} style={{ width: "7rem" }} />
               </div>
-              <span className="help">Để trống = toàn bộ video</span>
+              <span className="help">Để trống = phân tích toàn bộ video</span>
             </div>
           </div>
 
@@ -201,16 +201,26 @@ export default function AnalyzerForm({
 
           <div className="row">
             <div style={{ fontWeight: 500 }}>Bộ phát hiện khuôn mặt</div>
-            <div className="segmented" role="group" aria-label="Bộ phát hiện">
-              <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={() => setDetectorBackend("retinaface")}>RetinaFace (GPU)</button>
-              <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={() => setDetectorBackend("mediapipe")}>MediaPipe (CPU)</button>
+            <div>
+              <div className="segmented" role="group" aria-label="Bộ phát hiện">
+                <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={() => setDetectorBackend("retinaface")}>RetinaFace (GPU)</button>
+                <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={() => setDetectorBackend("mediapipe")}>MediaPipe (CPU)</button>
+              </div>
+              <div className="help" style={{ marginTop: "0.4rem" }}>
+                Dùng để phát hiện khuôn mặt đối tượng.
+              </div>
             </div>
           </div>
 
           <div className="row">
             <div style={{ fontWeight: 500 }}>Tỷ lệ khung viền</div>
-            <input type="number" step={0.01} min={1.0} max={1.6} value={bboxScale}
-              onChange={(e) => setBboxScale(parseFloat(e.target.value || "1.10"))} />
+            <div>
+              <input type="number" step={0.01} min={0.1} max={2.0} value={bboxScale}
+                onChange={(e) => setBboxScale(parseFloat(e.target.value || "1.10"))} />
+              <div className="help" style={{ marginTop: "0.4rem" }}>
+                Giá trị càng nhỏ càng sát mặt, càng lớn càng bao quát.
+              </div>
+            </div>
           </div>
 
           <div className="row">
@@ -226,7 +236,7 @@ export default function AnalyzerForm({
                 value={thrOverride} onChange={(e) => setThrOverride(e.target.value)} disabled={isMultiModel} />
               {isMultiModel && (
                 <div className="help" style={{ marginTop: "0.4rem" }}>
-                  Không khả dụng khi bật nhiều mô hình (sử dụng ngưỡng tổng hợp).
+                  Không khả dụng khi nhiều mô hình đang chạy.
                 </div>
               )}
             </div>
@@ -240,16 +250,13 @@ export default function AnalyzerForm({
             </div>
           </div>
 
-          {xaiMode === "full" && enabledModels.length >= 2 && (
+          {xaiMode === "full" && (
             <div className="row">
-              <div style={{ fontWeight: 500 }}>Mô hình XAI</div>
-              <div className="stack">
-                <select value={xaiModelId} onChange={(e) => setXaiModelId(e.target.value)}>
-                  <option value="auto">Tự động (mô hình bật đầu tiên)</option>
-                  {enabledModels.map((m) => (<option key={m.id} value={m.id}>{m.name || m.id}</option>))}
-                </select>
-                <div className="help">Chỉ các mô hình đang bật mới có thể dùng cho trực quan hoá Grad-CAM.</div>
-              </div>
+              <div style={{ fontWeight: 500 }}>Bản đồ nhiệt</div>
+              <select value={xaiModelId} onChange={(e) => setXaiModelId(e.target.value)} style={{ maxWidth: "16rem" }}>
+                <option value="auto">Tự động (mô hình bật đầu tiên)</option>
+                {enabledModels.map((m) => (<option key={m.id} value={m.id}>{m.name || m.id}</option>))}
+              </select>
             </div>
           )}
         </div>

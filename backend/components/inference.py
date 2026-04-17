@@ -139,7 +139,7 @@ def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
             blocks = backbone.blocks
             if hasattr(blocks, "__len__") and len(blocks) > 0:
                 cls_name = backbone.__class__.__name__.lower()
-                # EffNet: hook block sớm hơn một chút để tránh map chỉ ở rìa box
+                # EfficientNet: blocks[-2] — discriminative nhất, oval mask lo phần còn lại
                 if "efficientnet" in cls_name and len(blocks) >= 2:
                     idx = len(blocks) - 2
                 else:
@@ -357,11 +357,14 @@ def analyze_video(
                 target_idx = 0
 
                 if is_vit:
+                    # smooth_output=True cho BEiT để blur heatmap phân mảnh
+                    _is_beit = "beit" in str(primary_info.get("model_name", "")).lower()
                     cam = generate_cam_vit(
                         primary_model,
                         x,
                         target_index=target_idx,
                         device=str(primary_device),
+                        smooth_output=_is_beit,
                     )
                 elif is_swin:
                     cam = generate_cam_swin(
@@ -371,12 +374,14 @@ def analyze_video(
                         device=str(primary_device),
                     )
                 elif cnn_target_layer is not None:
+                    _is_eff = "efficientnet" in str(primary_info.get("model_name", "")).lower()
                     cam = generate_cam_cnn(
                         primary_model,
                         x,
                         target_index=target_idx,
                         target_layer=cnn_target_layer,
                         device=str(primary_device),
+                        extra_smooth=_is_eff,
                     )
                 else:
                     cam = None

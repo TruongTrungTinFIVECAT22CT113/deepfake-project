@@ -12,9 +12,9 @@ class ArtifactProfile(TypedDict):
 ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
     "Audio2Animation": {
         "summary": (
-            "Audio2Animation sinh biểu cảm khuôn mặt từ giọng nói. "
-            "Thường lộ lỗi ở vùng miệng và chuyển động đầu, vì phải "
-            "suy ra chuyển động từ âm thanh chứ không dựa vào cảnh thật."
+            "Audio2Animation là một kỹ thuật dựa trên 3DMM kết hợp với GAN (Generative Adversarial Networks), để sinh biểu cảm khuôn mặt từ giọng nói kết hợp với một hình ảnh. "
+            "Thường lộ lỗi ở vùng miệng và chuyển động đầu, vì phải cử động các bộ phận trên khuôn mặt. "
+            "Suy ra chuyển động từ âm thanh chứ không dựa vào cảnh thật. "
         ),
         "artifacts": [
             (
@@ -27,20 +27,20 @@ ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
             ),
             (
                 "Geometry Distortion",
-                "Khi head shake hoặc quay nhanh, vùng má / cằm bị kéo giãn hoặc biến dạng nhẹ.",
+                "Khi lắc đầu hoặc quay nhanh, vùng má / cằm bị kéo giãn hoặc biến dạng nhẹ.",
             ),
         ],
     },
 
     "Deepfakes": {
         "summary": (
-            "Deepfakes cổ điển (autoencoder) thường tạo mask (mặt nạ) khuôn mặt rồi dán lên video gốc. "
-            "Điểm yếu rõ nhất là viền mặt, lệch tông màu da và da mịn bất thường."
+            "Deepfakes cổ điển (autoencoder) thường tạo lớp mặt nạ của đối tượng A dán lên khuôn mặt của đối tượng B. "
+            "Điểm yếu rõ nhất là viền mặt, lệch tông màu da và da đôi khi mịn bất thường. "
         ),
         "artifacts": [
             (
                 "Boundary Error",
-                "Đường viền mặt mờ/nhòe, có cảm giác mặt được dán lên khung hình (mask line).",
+                "Đường viền mặt mờ/nhòe, nhìn có cảm giác như một lớp keo dán lên khung hình.",
             ),
             (
                 "Color Mismatch",
@@ -48,15 +48,15 @@ ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
             ),
             (
                 "Texture Abnormality",
-                "Da mặt mịn như nhựa, mất chi tiết lỗ chân lông, nếp nhăn so với vùng cổ/trán.",
+                "Da mặt mịn như nhựa, mất chi tiết lỗ chân lông, nếp nhăn so với vùng xung quanh.",
             ),
         ],
     },
 
     "Face2Face": {
         "summary": (
-            "Face2Face điều khiển biểu cảm khuôn mặt dựa trên một actor (diễn viên) khác. "
-            "Thường lộ lỗi khi miệng hoạt động mạnh và khi ánh sáng / bóng trên mặt không khớp với chuyển động."
+            "Face2Face điều khiển biểu cảm khuôn mặt A dựa trên biểu cảm gốc của đối tượng B. "
+            "Thường lộ lỗi khi miệng hoạt động mạnh và khi ánh sáng / bóng trên mặt không khớp với chuyển động. "
         ),
         "artifacts": [
             (
@@ -65,7 +65,7 @@ ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
             ),
             (
                 "Lighting Error",
-                "Khi nhân vật quay đầu, ánh sáng trên mặt gần như không đổi, không ăn theo hướng nguồn sáng của cảnh.",
+                "Khi nhân vật quay đầu, ánh sáng trên mặt gần như không đổi, không phản xạ theo hướng nguồn sáng của cảnh vật.",
             ),
             (
                 "Geometry Distortion",
@@ -76,76 +76,76 @@ ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
 
     "FaceShifter": {
         "summary": (
-            "FaceShifter là GAN chất lượng cao, che giấu lỗi tốt hơn nhưng vẫn để lộ ở vùng mắt "
-            "và texture da khi quan sát kỹ."
+            "FaceShifter là GAN (Generative Adversarial Networks) chất lượng cao, che giấu lỗi tốt hơn nhưng vẫn rất yếu ở vùng mắt. "
+            "Kết cấu da không tự nhiên, một số vùng da tràn ra khỏi viền khuôn mặt khi quan sát kỹ. "
         ),
         "artifacts": [
             (
                 "Eye Artifact",
-                "Độ sắc nét/độ sáng hai mắt không đồng đều, highlight trong mắt không khớp với ánh sáng chung.",
+                "Độ sắc nét/độ sáng hai mắt không đồng đều, phản chiếu trong mắt không khớp với ánh sáng chung.",
             ),
             (
                 "Texture Abnormality",
-                "Da thiếu các chi tiết rất nhỏ (micro-detail), trông hơi 'mịn' hoặc bị bệt vùng má / trán.",
+                "Da thiếu các chi tiết rất nhỏ, trông hơi 'mịn' hoặc bị bệt vùng má / trán, và tràn ra khỏi viền khuôn mặt.",
             ),
             (
                 "Lighting Error",
-                "Ánh sáng trên mặt có lúc lệch nhẹ với cổ hoặc nền, đặc biệt ở các khung hình chuyển động.",
+                "Ánh sáng trên mặt có lúc lệch nhẹ với cổ hoặc nền, đặc biệt ở các khung hình chuyển động phức tạp.",
             ),
         ],
     },
 
     "FaceSwap": {
         "summary": (
-            "FaceSwap dùng landmark + blending để thay toàn bộ mặt. "
-            "Điểm yếu điển hình là viền mặt, lệch tông màu và méo hình khi đầu quay nhanh."
+            "FaceSwap là một kỹ thuật dùng các mốc và trộn, để thay toàn bộ khuôn mặt của đối tượng A sang cho phần đầu của đối tượng B. "
+            "Điểm yếu điển hình là viền mặt, lệch tông màu và méo hình khi đầu quay nhanh. "
         ),
         "artifacts": [
             (
                 "Boundary Error",
-                "Viền mặt rõ, nhất là ở vùng trán – tai – cằm, dễ thấy khi nhân vật xoay hoặc nghiêng đầu.",
+                "Viền mặt rõ, nhất là ở vùng trán, tai, cằm, dễ thấy khi nhân vật xoay hoặc nghiêng đầu.",
             ),
             (
                 "Color Mismatch",
-                "Màu da khuôn mặt không khớp màu cổ / tai, tạo cảm giác mặt bị 'dán' lên cơ thể.",
+                "Màu da khuôn mặt không khớp màu cổ / tai, tạo cảm giác khuôn mặt bị 'dán' lên cả cái đầu.",
             ),
             (
                 "Geometry Distortion",
-                "Khi quay nhanh, mặt có thể trượt nhẹ so với đầu thật hoặc bị kéo méo.",
+                "Khi quay nhanh, mặt có thể trượt nhẹ so với phần đầu thật hoặc bị kéo méo.",
             ),
         ],
     },
 
     "NeuralTextures": {
         "summary": (
-            "NeuralTextures học texture 3D của khuôn mặt và chiếu lại. "
-            "Điểm yếu chính là texture bị rạn khi quay đầu và ánh sáng không hoàn toàn khớp."
+            "NeuralTextures là một kỹ thuật dựa trên khả năng tạo ra kết cấu 3D của khuôn mặt người thật. Đây là loại rất khó để nhận biết bằng mắt thường. "
+            "Điểm yếu chính là kết cấu bị rạn khi quay đầu và ánh sáng không hoàn toàn khớp. "
         ),
         "artifacts": [
             (
                 "Texture Abnormality",
-                "Khi nhân vật xoay đầu, vùng má / trán xuất hiện pattern lạ hoặc rạn texture.",
+                "Khi nhân vật xoay đầu, vùng má / trán xuất hiện làn da lạ như bị rạn nứt.",
             ),
             (
                 "Color Mismatch",
-                "Shade màu trên mặt đôi khi không đúng với phần còn lại của khung hình.",
+                "Tông màu trên mặt đôi khi không đúng với phần còn lại của phần đầu.",
             ),
             (
                 "Lighting Error",
-                "Highlight / vùng sáng trên mặt không dịch chuyển đúng theo nguồn sáng khi nhân vật di chuyển.",
+                "Các vùng sáng trên mặt không dịch chuyển đúng theo nguồn sáng xung quanh khi nhân vật chuyển động.",
             ),
         ],
     },
 
     "Video2VideoID": {
         "summary": (
-            "Video2VideoID tái dựng lại toàn cảnh và nhân dạng giống video gốc nhưng thay đổi nội dung. "
-            "Thường lộ lỗi ở nền và hình học khi cảnh / nhân vật di chuyển."
+            "Video2VideoID là một kỹ thuật dựa trên mô hình Diffusion, sẽ nhận vào một nguồn ảnh hoặc video chứa khuôn mặt của một người, và tạo ra video mới với chính khuôn mặt đó nhưng nội dung, biểu cảm, hành động hoàn toàn khác — người đó có thể đang nói, di chuyển hoặc xuất hiện trong bối cảnh hoàn toàn bịa đặt không hề có thật trong đời thực. "
+            "Thường lộ lỗi ở các cảnh nền khi cảnh vật và nhân vật di chuyển. "
         ),
         "artifacts": [
             (
                 "Background Artifact",
-                "Nền phía sau nhân vật bị trôi, rung hoặc xuất hiện nhiễu bất thường giữa các khung hình.",
+                "Nền phía sau nhân vật bị trôi, rung hoặc xuất hiện nhiễu và mờ nhòe bất thường giữa các khung hình.",
             ),
             (
                 "Geometry Distortion",
@@ -153,7 +153,7 @@ ARTIFACT_PROFILES: Dict[str, ArtifactProfile] = {
             ),
             (
                 "Texture Abnormality",
-                "Một số vùng cảnh hoặc quần áo bị nhòe, texture không ổn định khi camera/nhân vật di chuyển.",
+                "Một số vùng cảnh hoặc quần áo bị nhòe, kết cấu hình ảnh không ổn định khi camera/nhân vật di chuyển.",
             ),
         ],
     },

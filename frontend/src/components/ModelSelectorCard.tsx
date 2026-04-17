@@ -12,9 +12,9 @@ export default function ModelSelectorCard({
 
   return (
     <div className="stack">
-      <div className="section-title">Mô hình</div>
+      <div className="section-title">Danh Sách Các Mô Hình</div>
       <div className="help" style={{ marginTop: -8 }}>
-        Chọn các mô hình phát hiện sử dụng khi phân tích.
+        Tùy chọn các mô hình bằng Checkbox.
       </div>
       <div className="model-list">
         {models.map((m) => {
@@ -43,7 +43,7 @@ export default function ModelSelectorCard({
         </div>
       )}
       <div className="help">
-        Cần giữ bật ít nhất 1 mô hình.
+        Cần ít nhất 1 mô hình được bật.
       </div>
     </div>
   );

@@ -214,7 +214,7 @@ export default function ResultPanel(props: {
       : null;
 
   const rows = r.method_rows_total?.length ? r.method_rows_total : r.method_rows_fake?.length ? r.method_rows_fake : r.method_rows || [];
-  const title = r.method_rows_total?.length ? "Phân bố phương pháp (toàn bộ khung hình)" : r.method_rows_fake?.length ? "Phân bố phương pháp (khung hình giả)" : "Phân bố phương pháp";
+  const title = r.method_rows_total?.length ? "Các loại kỹ thuật Deepfake được sử dụng" : r.method_rows_fake?.length ? "Phân bố phương pháp (khung hình giả)" : "Phân bố phương pháp";
   const tags: string[] = r.frame_tags || [];
   const totalFrames = typeof r.frames_total === "number" ? r.frames_total : tags?.length || 0;
   const cmap = buildColorMap(tags);
@@ -259,19 +259,19 @@ export default function ResultPanel(props: {
       {analyzedLabel && <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>{analyzedLabel}</div>}
 
       {typeof r.threshold_used === "number" && (
-        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Ngưỡng sử dụng: <b>{r.threshold_used.toFixed(3)}</b></div>
+        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Ngưỡng đã sử dụng: <b>{r.threshold_used.toFixed(3)}</b></div>
       )}
       {r.detector_backend_used && (
-        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Bộ phát hiện: <b>{r.detector_backend_used}</b></div>
+        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Bộ phát hiện khuôn mặt: <b>{r.detector_backend_used}</b></div>
       )}
       {r.thr_override_ignored && (
-        <div className="warn">Đang bật nhiều mô hình — sử dụng ngưỡng tổng hợp (bỏ qua giá trị ghi đè).</div>
+        <div className="warn">Đang có nhiều hơn 1 mô hình phân tích được bật.</div>
       )}
 
       {/* Timeline */}
       {totalFrames > 0 && tags?.length === totalFrames ? (
         <div className="stack">
-          <div className="section-title">Dòng thời gian khung hình</div>
+          <div className="section-title">Dòng thời gian phân bổ khung hình của video</div>
           <div style={{ display: "flex", alignItems: "stretch", height: "1rem", borderRadius: "0.5rem", overflow: "hidden", background: "var(--surface-3)", border: "1px solid var(--border-subtle)" }}
             title="Dòng thời gian theo từng khung hình">
             {tags.map((t, i) => (
@@ -324,7 +324,7 @@ export default function ResultPanel(props: {
         <div className="stack">
           <div className="section-title">{title}</div>
           <table className="pretty">
-            <thead><tr><th>Phương pháp</th><th style={{ width: "6rem" }}>Tỷ lệ</th><th></th></tr></thead>
+            <thead><tr><th>Kỹ Thuật</th><th style={{ width: "6rem" }}>Tỷ lệ</th><th></th></tr></thead>
             <tbody>
               {rows.map(([m, p], i) => (
                 <tr key={i}>
@@ -341,7 +341,7 @@ export default function ResultPanel(props: {
       {/* Explanation */}
       {r.explanation_basic && (
         <div className="stack">
-          <div className="section-title">Giải thích — {r.explanation_basic.method}</div>
+          <div className="section-title">Giải thích Về {r.explanation_basic.method}</div>
           <div style={{ fontSize: "0.9rem", lineHeight: 1.7, color: "var(--text-secondary)" }}>
             <p>
               Kỹ thuật <b style={{ color: "var(--text)" }}>{r.explanation_basic.method}</b> chiếm{" "}

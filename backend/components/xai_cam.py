@@ -11,13 +11,11 @@ import torch.nn.functional as F
 from torch import nn
 
 
-# ----------------- COMMON UTILS -----------------
+# ═══════════════════════════════════════════════════════════════
+# COMMON UTILS
+# ═══════════════════════════════════════════════════════════════
 
 def _normalize_cam(cam: torch.Tensor) -> np.ndarray:
-    """
-    cam: [H, W] tensor
-    -> numpy 0..1
-    """
     cam = cam.detach()
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-6)
@@ -25,20 +23,14 @@ def _normalize_cam(cam: torch.Tensor) -> np.ndarray:
 
 def overlay_heatmap_on_bgr(frame_bgr: np.ndarray, cam_2d: np.ndarray, alpha: float = 0.6) -> np.ndarray:
     cam_resized = cv2.resize(cam_2d, (frame_bgr.shape[1], frame_bgr.shape[0]))
-
-    # Giữ trong [0,1] và dùng gamma < 1 để làm nổi vùng có giá trị cao
     cam_resized = np.clip(cam_resized, 0.0, 1.0)
-    cam_resized = np.power(cam_resized, 0.6)  # vùng nóng -> đỏ/vàng rõ hơn
-
+    cam_resized = np.power(cam_resized, 0.6)
     cam_uint8 = (cam_resized * 255).astype(np.uint8)
     heat = cv2.applyColorMap(cam_uint8, cv2.COLORMAP_JET)
     out = cv2.addWeighted(heat, alpha, frame_bgr, 1 - alpha, 0)
     return out
 
 def save_cam_image(frame_bgr: np.ndarray, cam_2d: np.ndarray, out_dir: Optional[str] = None) -> str:
-    """
-    Lưu ảnh overlay, trả về path
-    """
     merged = overlay_heatmap_on_bgr(frame_bgr, cam_2d)
     if out_dir is None:
         out_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
@@ -49,68 +41,167 @@ def save_cam_image(frame_bgr: np.ndarray, cam_2d: np.ndarray, out_dir: Optional[
     return out_path
 
 
-# ----------------- CNN GRAD-CAM -----------------
+# ═══════════════════════════════════════════════════════════════
+# CNN — GradCAM++ + SmoothGrad
+# ═══════════════════════════════════════════════════════════════
+
+def _gradcam_original_single(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    target_layer: nn.Module,
+    target_index: int,
+    device: str,
+) -> np.ndarray:
+    """GradCAM thường — hoạt động tốt hơn GradCAM++ với EfficientNet."""
+    features = {}
+    gradients = {}
+
+    def fwd_hook(module, inp, out):
+        features["value"] = out.detach()
+
+    def bwd_hook(module, gin, gout):
+        gradients["value"] = gout[0].detach()
+
+    h1 = target_layer.register_forward_hook(fwd_hook)
+    h2 = target_layer.register_backward_hook(bwd_hook)
+
+    with torch.enable_grad():
+        inp = input_tensor.clone().requires_grad_(True)
+        out = model(inp)
+        logits_bin = out[0] if isinstance(out, (list, tuple)) else out
+        score = logits_bin[0, target_index]
+        model.zero_grad()
+        score.backward()
+
+    h1.remove()
+    h2.remove()
+
+    feat = features["value"]   # [1, C, h, w]
+    grad = gradients["value"]  # [1, C, h, w]
+    weights = grad.mean(dim=(2, 3), keepdim=True)
+    cam = (weights * feat).sum(dim=1).squeeze(0)
+    cam = F.relu(cam)
+    return _normalize_cam(cam)
+
+
+def _gradcam_plus_plus_single(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    target_layer: nn.Module,
+    target_index: int,
+    device: str,
+) -> np.ndarray:
+    """
+    GradCAM++ cho 1 lần forward.
+    Cải tiến so với GradCAM thường:
+    - Dùng bậc 2 và bậc 3 của gradient để tính alpha weights
+    - Cho phép tập trung vào nhiều vùng nhỏ cùng lúc thay vì chỉ 1 vùng lớn
+    - Fix vấn đề ConvNeXt/EfficientNet chỉ highlight 1 vùng không ổn định
+    """
+    features = {}
+    gradients = {}
+
+    def fwd_hook(module, inp, out):
+        features["value"] = out.detach()
+
+    def bwd_hook(module, gin, gout):
+        gradients["value"] = gout[0].detach()
+
+    h1 = target_layer.register_forward_hook(fwd_hook)
+    h2 = target_layer.register_backward_hook(bwd_hook)
+
+    with torch.enable_grad():
+        inp = input_tensor.clone().requires_grad_(True)
+        out = model(inp)
+        logits_bin = out[0] if isinstance(out, (list, tuple)) else out
+        score = logits_bin[0, target_index]
+        model.zero_grad()
+        score.backward()
+
+    h1.remove()
+    h2.remove()
+
+    feat = features["value"]    # [1, C, h, w]
+    grad = gradients["value"]   # [1, C, h, w]
+
+    # ── GradCAM++ alpha weights ──
+    grad_2 = grad ** 2
+    grad_3 = grad ** 3
+    # global sum của feature map nhân grad bậc 3
+    sum_act = feat.sum(dim=(2, 3), keepdim=True)          # [1, C, 1, 1]
+    denom = 2.0 * grad_2 + sum_act * grad_3 + 1e-7
+    alpha = grad_2 / denom                                 # [1, C, 1, 1]
+    # chỉ giữ phần dương của gradient (ReLU)
+    weights = (alpha * F.relu(grad)).sum(dim=(2, 3), keepdim=True)  # [1, C, 1, 1]
+
+    cam = (weights * feat).sum(dim=1).squeeze(0)           # [h, w]
+    cam = F.relu(cam)
+    return _normalize_cam(cam)
+
 
 def generate_cam_cnn(
     model: nn.Module,
-    input_tensor: torch.Tensor,   # [1,3,H,W] normalized
-    target_index: int = 1,        # lớp "fake"
+    input_tensor: torch.Tensor,
+    target_index: int = 1,
     target_layer: Optional[nn.Module] = None,
     device: str = "cuda",
-) -> torch.Tensor:
+    smooth_samples: int = 3,
+    smooth_noise: float = 0.015,
+    extra_smooth: bool = False,
+) -> np.ndarray:
     """
-    Grad-CAM cho CNN:
-      - target_layer: layer conv cuối cùng (vd model.layer4[-1] của ResNet)
-    Trả: cam [H,W] (numpy 0..1)
+    GradCAM++ + SmoothGrad cho CNN (ConvNeXt, EfficientNet, ResNetRS...).
+
+    SmoothGrad: chạy GradCAM++ nhiều lần với Gaussian noise nhỏ rồi average.
+    - Fix vấn đề heatmap nhảy lung tung giữa các frame
+    - Noise nhỏ (0.015) không làm thay đổi dự đoán nhưng ổn định gradient
+    - smooth_samples=10 cho kết quả tốt, tăng lên 20 nếu muốn mịn hơn (chậm hơn)
     """
     model.eval()
     input_tensor = input_tensor.to(device)
 
     if target_layer is None:
-        raise ValueError("Bạn phải truyền target_layer (conv cuối của CNN) vào generate_cam_cnn")
+        raise ValueError("Bạn phải truyền target_layer vào generate_cam_cnn")
 
-    features = {}
-    gradients = {}
+    inp_std = float(input_tensor.std().item()) * smooth_noise
 
-    def fwd_hook(module, inp, out):
-        features["value"] = out
+    # EfficientNet dùng GradCAM thường (không GradCAM++) vì compound scaling
+    # làm GradCAM++ cho ra heatmap flat. Các CNN khác dùng GradCAM++.
+    single_fn = _gradcam_original_single if extra_smooth else _gradcam_plus_plus_single
 
-    def bwd_hook(module, gin, gout):
-        gradients["value"] = gout[0]
+    cams = []
+    for _ in range(smooth_samples):
+        noise = torch.randn_like(input_tensor) * inp_std
+        noisy = (input_tensor + noise).to(device)
+        cams.append(single_fn(model, noisy, target_layer, target_index, device))
 
-    # gắn hook
-    h1 = target_layer.register_forward_hook(fwd_hook)
-    h2 = target_layer.register_backward_hook(bwd_hook)
+    cam_avg = np.mean(np.stack(cams, axis=0), axis=0)
+    cam_avg = cam_avg - cam_avg.min()
+    cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
-    with torch.enable_grad():
-        out = model(input_tensor)
-        # Multi-head: (logits_bin, logits_method, extra, ...)
-        if isinstance(out, (list, tuple)):
-            logits_bin = out[0]
-        else:
-            logits_bin = out
-        score = logits_bin[0, target_index]
-        model.zero_grad()
-        score.backward()
+    # EfficientNet: oval mask tập trung vào vùng mặt
+    # cy=0.40 vì crop EfficientNet ít cắt trán hơn ViT
+    if extra_smooth:
+        H_c, W_c = cam_avg.shape
+        cy = int(H_c * 0.40)
+        cx = int(W_c * 0.50)
+        ry = int(H_c * 0.42)
+        rx = int(W_c * 0.40)
+        Y, X = np.ogrid[:H_c, :W_c]
+        dist = ((X - cx) / max(rx, 1)) ** 2 + ((Y - cy) / max(ry, 1)) ** 2
+        oval_mask = np.clip(1.5 - dist, 0.0, 1.0).astype(np.float32)
+        oval_mask = cv2.GaussianBlur(oval_mask, (0, 0), sigmaX=20, sigmaY=20)
+        cam_avg = cam_avg * oval_mask
+        cam_avg = cam_avg - cam_avg.min()
+        cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
-    # bỏ hook
-    h1.remove()
-    h2.remove()
-
-    # lấy feats + grads
-    feat = features["value"]     # [1,C,h,w]
-    grad = gradients["value"]    # [1,C,h,w]
-
-    # global average pooling qua H,W để lấy weight cho từng channel
-    weights = grad.mean(dim=(2, 3), keepdim=True)   # [1,C,1,1]
-    cam = (weights * feat).sum(dim=1).squeeze(0)    # [h,w]
-
-    cam = F.relu(cam)
-    cam = _normalize_cam(cam)
-    return cam  # [h,w] float 0..1
+    return cam_avg
 
 
-# ----------------- ViT GRAD-CAM -----------------
+# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# ViT / BEiT — GradCAM bản gốc (hook block cuối)
+# ═══════════════════════════════════════════════════════════════
 
 def generate_cam_vit(
     vit_model: nn.Module,
@@ -118,12 +209,13 @@ def generate_cam_vit(
     target_index: int = 1,
     device: str = "cuda",
     patch_size: int = 16,
-) -> torch.Tensor:
+    smooth_output: bool = False,
+) -> np.ndarray:
     """
-    Grad-CAM dạng đơn giản cho ViT timm:
+    Grad-CAM cho ViT/BEiT timm:
       - hook vào block cuối (transformer encoder)
       - dùng patch token (bỏ cls token)
-      - nếu map Grad-CAM gần như phẳng -> fallback sang 'feature energy'
+      - nếu map Grad-CAM gần như phẳng -> fallback sang feature energy
     """
     vit_model.eval()
     input_tensor = input_tensor.to(device)
@@ -132,7 +224,6 @@ def generate_cam_vit(
     if not hasattr(backbone, "blocks"):
         raise ValueError("ViT backbone không có thuộc tính .blocks (mong đợi timm VisionTransformer).")
 
-    # Kích thước input & lưới patch
     _, _, H, W = input_tensor.shape
     h_p = H // patch_size
     w_p = W // patch_size
@@ -142,7 +233,6 @@ def generate_cam_vit(
     last_block = backbone.blocks[-1]
 
     def fwd_hook(module, inp, out):
-        # out: [B, N, C] (N = 1 + h_p*w_p)
         feats["value"] = out
 
     def bwd_hook(module, gin, gout):
@@ -151,17 +241,14 @@ def generate_cam_vit(
     h1 = last_block.register_forward_hook(fwd_hook)
     h2 = last_block.register_backward_hook(bwd_hook)
 
-    # ------- Bước 1: Grad-CAM chuẩn -------
     with torch.enable_grad():
         x = input_tensor.clone().detach().to(device)
         x.requires_grad_(True)
-
         out = vit_model(x)
         if isinstance(out, (list, tuple)):
             logits_bin = out[0]
         else:
             logits_bin = out
-
         score = logits_bin[0, target_index]
         vit_model.zero_grad()
         score.backward(retain_graph=False)
@@ -173,13 +260,12 @@ def generate_cam_vit(
     grad_tokens = grads["value"]   # [1, N, C]
 
     # bỏ cls token
-    tokens = tokens[:, 1:, :]          # [1, h*w, C]
-    grad_tokens = grad_tokens[:, 1:, :]  # [1, h*w, C]
+    tokens = tokens[:, 1:, :]
+    grad_tokens = grad_tokens[:, 1:, :]
 
-    # weights: global avg over tokens
-    weights = grad_tokens.mean(dim=1, keepdim=True)        # [1,1,C]
-    cam_patch = torch.bmm(tokens, weights.transpose(1, 2)) # [1, h*w, 1]
-    cam_patch = cam_patch.view(1, h_p, w_p)                # [1,h_p,w_p]
+    weights = grad_tokens.mean(dim=1, keepdim=True)
+    cam_patch = torch.bmm(tokens, weights.transpose(1, 2))
+    cam_patch = cam_patch.view(1, h_p, w_p)
     cam_patch = F.relu(cam_patch)
 
     cam_up = F.interpolate(
@@ -187,25 +273,20 @@ def generate_cam_vit(
         size=(H, W),
         mode="bilinear",
         align_corners=False,
-    ).squeeze(0).squeeze(0)  # [H,W]
+    ).squeeze(0).squeeze(0)
 
-    # Nếu map gần như phẳng (khác biệt rất nhỏ) -> fallback
+    # Fallback nếu map phẳng
     contrast = float((cam_up.max() - cam_up.min()).item())
-
     if contrast < 1e-6:
-        # ------- Bước 2: Fallback = feature-energy map -------
         with torch.no_grad():
             feats2: dict = {}
             def fwd_hook2(module, inp, out):
                 feats2["value"] = out
-
             h3 = last_block.register_forward_hook(fwd_hook2)
             _ = vit_model(input_tensor.to(device))
             h3.remove()
-
-            tokens2 = feats2["value"][:, 1:, :]  # [1,h*w,C]
-            cam_patch2 = tokens2.pow(2).sum(dim=-1).view(1, h_p, w_p)  # L2 energy
-
+            tokens2 = feats2["value"][:, 1:, :]
+            cam_patch2 = tokens2.pow(2).sum(dim=-1).view(1, h_p, w_p)
             cam_up = F.interpolate(
                 cam_patch2.unsqueeze(1),
                 size=(H, W),
@@ -213,52 +294,74 @@ def generate_cam_vit(
                 align_corners=False,
             ).squeeze(0).squeeze(0)
 
-    # Chuẩn hoá 0..1 và trả về numpy
     cam_norm = _normalize_cam(cam_up)
-    return cam_norm  # [H,W] float 0..1
+
+    # Áp oval mask để cắt bớt vùng tràn ra ngoài mặt
+    # BEiT: ellipse nhỏ hơn + blur mạnh hơn vì gradient loạn hơn
+    # ViT: ellipse rộng hơn, chỉ cắt phần tràn ra tóc/nền
+    if smooth_output:
+        # BEiT — ellipse nhỏ, suppress mạnh
+        _ry_frac, _rx_frac = 0.42, 0.38
+        _sigma = 15
+    else:
+        # ViT — ellipse rộng hơn, chỉ cắt phần tràn
+        _ry_frac, _rx_frac = 0.50, 0.46
+        _sigma = 20
+
+    if True:  # áp cho cả ViT lẫn BEiT
+        H_c, W_c = cam_norm.shape
+        cy = int(H_c * 0.48)
+        cx = int(W_c * 0.50)
+        ry = int(H_c * _ry_frac)
+        rx = int(W_c * _rx_frac)
+        Y, X = np.ogrid[:H_c, :W_c]
+        dist = ((X - cx) / max(rx, 1)) ** 2 + ((Y - cy) / max(ry, 1)) ** 2
+        oval_mask = np.clip(1.5 - dist, 0.0, 1.0).astype(np.float32)
+        oval_mask = cv2.GaussianBlur(oval_mask, (0, 0), sigmaX=_sigma, sigmaY=_sigma)
+        cam_norm = cam_norm * oval_mask
+        cam_norm = cam_norm - cam_norm.min()
+        cam_norm = cam_norm / (cam_norm.max() + 1e-6)
+        # Tăng contrast: power > 1 làm vùng thấp xuống nhanh hơn
+        # chỉ giữ lại vùng thực sự "nóng", tránh cả mặt đỏ đều
+        _power = 2.2 if not smooth_output else 1.5
+        cam_norm = np.power(cam_norm, _power)
+
+    return cam_norm
 
 
-# ----------------- Swin GRAD-CAM -----------------
+# ═══════════════════════════════════════════════════════════════
+# Swin GRAD-CAM (giữ nguyên, Swin thường ổn hơn ViT/CNN)
+# ═══════════════════════════════════════════════════════════════
 
 def generate_cam_swin(
     swin_model: nn.Module,
-    input_tensor: torch.Tensor,    # [1,3,H,W] normalized
+    input_tensor: torch.Tensor,
     target_index: int = 1,
     device: str = "cuda",
-) -> torch.Tensor:
+) -> np.ndarray:
     """
-    Grad-CAM token-based cho Swin / SwinV2 timm:
-      - hook vào block cuối của stage cuối (backbone.layers[-1].blocks[-1])
-      - output block thường là [B, N, C] (N = h*w)
-      - reshape về lưới h x w rồi upsample lên H x W
+    Grad-CAM token-based cho Swin / SwinV2 timm.
+    Hook vào block cuối của stage cuối.
     """
     swin_model.eval()
     input_tensor = input_tensor.to(device)
     backbone = getattr(swin_model, "backbone", swin_model)
 
     if not hasattr(backbone, "layers"):
-        raise ValueError("Swin backbone không có thuộc tính .layers (mong đợi timm SwinTransformer).")
+        raise ValueError("Swin backbone không có thuộc tính .layers")
 
     layers = backbone.layers
-    if not hasattr(layers, "__len__") or len(layers) == 0:
-        raise ValueError("Swin backbone.layers rỗng.")
-
     last_stage = layers[-1]
     blocks = getattr(last_stage, "blocks", None)
-    if blocks is None or (hasattr(blocks, "__len__") and len(blocks) == 0):
-        raise ValueError("Swin stage cuối không có blocks để hook Grad-CAM.")
+    if not blocks or len(blocks) == 0:
+        raise ValueError("Swin stage cuối không có blocks.")
 
     last_block = blocks[-1]
-
     feats: dict = {}
     grads: dict = {}
 
-    def fwd_hook(module, inp, out):
-        # out: [B, N, C] hoặc [B, H, W, C]
-        feats["value"] = out
-
-    def bwd_hook(module, gin, gout):
-        grads["value"] = gout[0]
+    def fwd_hook(module, inp, out): feats["value"] = out
+    def bwd_hook(module, gin, gout): grads["value"] = gout[0]
 
     h1 = last_block.register_forward_hook(fwd_hook)
     h2 = last_block.register_backward_hook(bwd_hook)
@@ -266,13 +369,8 @@ def generate_cam_swin(
     with torch.enable_grad():
         x = input_tensor.clone().detach().to(device)
         x.requires_grad_(True)
-
         out = swin_model(x)
-        if isinstance(out, (list, tuple)):
-            logits_bin = out[0]
-        else:
-            logits_bin = out
-
+        logits_bin = out[0] if isinstance(out, (list, tuple)) else out
         score = logits_bin[0, target_index]
         swin_model.zero_grad()
         score.backward(retain_graph=False)
@@ -284,36 +382,29 @@ def generate_cam_swin(
     grad_tokens = grads["value"]
 
     if tokens.dim() == 4:
-        # [B, H_p, W_p, C]
         B, H_p, W_p, C = tokens.shape
         tokens = tokens.view(B, H_p * W_p, C)
         grad_tokens = grad_tokens.view(B, H_p * W_p, C)
         h_p, w_p = H_p, W_p
     elif tokens.dim() == 3:
-        # [B, N, C] -> suy ra lưới vuông h_p x w_p
         B, N, C = tokens.shape
-        h_p = int(N**0.5)
+        h_p = int(N ** 0.5)
         w_p = h_p
         if h_p * w_p > N:
             h_p = w_p = N
-        tokens = tokens[:, : h_p * w_p, :]
-        grad_tokens = grad_tokens[:, : h_p * w_p, :]
+        tokens = tokens[:, :h_p * w_p, :]
+        grad_tokens = grad_tokens[:, :h_p * w_p, :]
     else:
-        raise ValueError(f"Shape output Swin block không hỗ trợ cho Grad-CAM: {tokens.shape}")
+        raise ValueError(f"Shape output Swin không hỗ trợ: {tokens.shape}")
 
-    # weights: global avg over tokens
-    weights = grad_tokens.mean(dim=1, keepdim=True)          # [B,1,C]
-    cam_patch = torch.bmm(tokens, weights.transpose(1, 2))   # [B, N, 1]
-    cam_patch = cam_patch.view(1, 1, h_p, w_p)               # [1,1,h_p,w_p]
+    weights = grad_tokens.mean(dim=1, keepdim=True)
+    cam_patch = torch.bmm(tokens, weights.transpose(1, 2))
+    cam_patch = cam_patch.view(1, 1, h_p, w_p)
     cam_patch = F.relu(cam_patch)
 
     _, _, H, W = input_tensor.shape
     cam_up = F.interpolate(
-        cam_patch,
-        size=(H, W),
-        mode="bilinear",
-        align_corners=False,
-    ).squeeze(0).squeeze(0)  # [H,W]
+        cam_patch, size=(H, W), mode="bilinear", align_corners=False,
+    ).squeeze(0).squeeze(0)
 
-    cam_norm = _normalize_cam(cam_up)
-    return cam_norm
+    return _normalize_cam(cam_up)
