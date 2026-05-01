@@ -126,7 +126,7 @@ a { color: var(--accent); text-decoration: none; transition: color var(--transit
 a:hover { color: var(--accent-hover); text-decoration: underline; }
 
 .container {
-  max-width: 120rem;
+  max-width: 1500px;
   margin: 0 auto;
   padding: 1rem 1vw 1rem;
   flex: 1 0 auto;
@@ -258,7 +258,7 @@ table.pretty th { color: var(--text-secondary); font-weight: 600; text-align: le
 table.pretty tr:hover td { background: var(--accent-glow); }
 table.pretty tr { transition: background var(--transition); }
 
-.bar { height: 0.5rem; background: var(--surface-3); border: 1px solid var(--border-subtle); border-radius: 999px; overflow: hidden; }
+.bar { height: 0.5rem; background: var(--surface-3); border: 1px solid var(--border-subtle); border-radius: 999px; overflow: hidden; min-width: 120px; }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
 
 video.media { width: 100%; border-radius: var(--radius); outline: none; border: 1px solid var(--border); background: #000; }
@@ -322,7 +322,7 @@ summary::-webkit-details-marker { display: none; }
 .toast.error { border-color: var(--danger-border); background: var(--danger-bg); color: var(--danger); }
 
 /* Layout */
-.layout-top { display: grid; grid-template-columns: minmax(20rem, 1fr) 2fr; gap: 0.75rem; align-items: start; }
+.layout-top { display: grid; grid-template-columns: 350px 1fr; gap: 0.75rem; align-items: start; }
 .full-span { grid-column: 1 / -1; }
 @media (max-width: 980px) { .layout-top { grid-template-columns: 1fr; } .full-span { grid-column: auto; } }
 
@@ -472,4 +472,175 @@ html[data-theme="light"] .segmented { background: var(--surface-3); }
   text-align: center;
   padding-top: 0.5rem;
   border-top: 1px solid var(--border-subtle);
+}
+
+.explanation-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr; /* Chia đôi 50/50 */
+  gap: 2rem;
+  align-items: start;
+  position: relative;
+}
+.explanation-layout::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-subtle); /* Sử dụng màu border sẵn có */
+  transform: translateX(-50%);
+}
+@media (max-width: 980px) {
+.explanation-layout::after { display: none; }
+.explanation-layout { grid-template-columns: 1fr; gap: 1.5rem; }
+}
+
+/* Áp dụng hiệu ứng mũi tên cho tất cả summary có class section-title */
+summary.section-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  user-select: none;
+}
+
+summary.section-title::before {
+  content: "▸";
+  font-size: 0.75rem;
+  color: var(--muted);
+  transition: transform var(--transition);
+}
+
+details[open] summary.section-title::before {
+  transform: rotate(90deg);
+}
+
+/* Ẩn dấu mũi tên mặc định của trình duyệt */
+summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Thu hẹp cột Tỷ lệ và ngăn nó chiếm thêm chỗ */
+table.pretty th.col-ratio, 
+table.pretty td.col-ratio {
+  width: 1%;           /* Ép độ rộng nhỏ nhất có thể */
+  white-space: nowrap; /* Đảm bảo con số không bị nhảy dòng */
+  text-align: right;
+  padding-right: 2rem; /* Khoảng cách giữa con số và thanh biểu đồ */
+}
+
+/* Ép cột thanh biểu đồ chiếm toàn bộ không gian còn lại */
+table.pretty th.col-bar,
+table.pretty td.col-bar {
+  width: 100%;         
+  padding-left: 0;
+}
+
+/* Tùy chỉnh Flash notice (Tooltip) mới */
+.row {
+  position: relative; /* Để làm gốc tọa độ cho tooltip */
+}
+
+/* Ẩn thuộc tính title mặc định để không bị hiện chồng 2 cái */
+.row[data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%; /* Hiện phía trên dòng */
+  left: 20px;
+  transform: translateY(-8px);
+  
+  /* Style: Nền trắng chữ đen */
+  background: #ffffff;
+  color: #000000;
+  padding: 8px 14px;
+  border-radius: 6px;
+  font-size: 13px; /* To hơn */
+  font-weight: 500;
+  white-space: nowrap;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  border: 1px solid #ddd;
+  
+  /* Hiệu ứng ẩn/hiện */
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.2s ease;
+  z-index: 100;
+}
+
+/* Khi di chuột vào tiêu đề hoặc row thì hiện ra */
+.row[data-tooltip]:hover::after {
+  opacity: 1;
+  transform: translateY(-12px);
+}
+
+/* Thêm một cái mũi tên nhỏ phía dưới cho đẹp */
+.row[data-tooltip]:hover::before {
+  content: "";
+  position: absolute;
+  bottom: 100%;
+  left: 35px;
+  transform: translateY(0);
+  border: 6px solid transparent;
+  border-top-color: #ffffff;
+  opacity: 1;
+  z-index: 101;
+}
+
+/* Layout chia đôi cho Cài đặt nâng cao */
+.settings-split-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr; /* Chia đều 2 bên */
+  gap: 2rem;
+  position: relative;
+}
+
+/* Đường kẻ dọc ở giữa */
+.settings-split-layout::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border-subtle);
+  transform: translateX(-50%);
+}
+
+/* Responsive cho mobile: xếp chồng lên nhau và ẩn đường kẻ */
+@media (max-width: 980px) {
+  .settings-split-layout {
+    grid-template-columns: 1fr;
+  }
+  .settings-split-layout::after {
+    display: none;
+  }
+}
+
+/* Styles cho Badge Cảnh báo Deepfake */
+.warn-badge {
+  display: inline-flex;
+  align-items: center;
+  background-color: rgba(239, 107, 107, 0.15);
+  color: #ef6b6b; /* Màu fakeColor mặc định */
+  padding: 2px 10px;
+  border-radius: 6px;
+  border: 1px solid #ef6b6b;
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+  font-weight: 600;
+  animation: pulse-red 2s infinite;
+}
+
+/* Hiệu ứng nhịp thở cho cảnh báo */
+@keyframes pulse-red {
+  0% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(1.02); }
+  100% { opacity: 1; transform: scale(1); }
+}
+
+/* Đồng bộ màu sắc cho chủ đề mù màu (nếu có class .colorblind trên body/html) */
+[data-theme="colorblind"] .warn-badge {
+  color: #e8874a;
+  border-color: #e8874a;
+  background-color: rgba(232, 135, 74, 0.15);
 }

@@ -65,7 +65,6 @@ function formatAnalyzedRange(dur: number | undefined, aStart?: number | null, aE
   return `Đã phân tích: ${fmt(start)} → ${fmt(end)}`;
 }
 
-// Generate stats report as text
 function buildStatsReport(r: any): string {
   const lines: string[] = [];
   lines.push("═══════════════════════════════════════");
@@ -81,8 +80,6 @@ function buildStatsReport(r: any): string {
     lines.push(`Khung hình giả:  ${r.fake_frames ?? 0} (${((r.fake_ratio ?? 0) * 100).toFixed(1)}%)`);
     lines.push(`Khung hình thật: ${real} (${((1 - (r.fake_ratio ?? 0)) * 100).toFixed(1)}%)`);
   }
-  if (r.threshold_used != null) lines.push(`Ngưỡng sử dụng: ${r.threshold_used.toFixed(3)}`);
-  if (r.detector_backend_used) lines.push(`Bộ phát hiện: ${r.detector_backend_used}`);
   if (r.duration_sec) lines.push(`Thời lượng video: ${r.duration_sec.toFixed(1)}s`);
   if (r.fps) lines.push(`FPS: ${r.fps}`);
 
@@ -123,17 +120,29 @@ export default function ResultPanel(props: {
   const [rate, setRate] = useState(1.0);
   const [showCompare, setShowCompare] = useState(false);
 
-  useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = rate; }, [rate]);
+  // 1. Đồng bộ tốc độ phát cho cả hai video
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = rate;
+    if (previewVideoRef.current) previewVideoRef.current.playbackRate = rate;
+  }, [rate, showCompare]);
 
-  // Sync playback in compare mode
-  const syncPlay = useCallback(() => {
-    if (!showCompare) return;
-    const a = previewVideoRef.current;
-    const b = videoRef.current;
-    if (a && b) { b.currentTime = a.currentTime; b.play(); }
+  // 2. Logic đồng bộ hóa hai chiều (Sync Logic)
+  const syncVideos = useCallback((source: HTMLVideoElement, target: HTMLVideoElement | null) => {
+    if (!showCompare || !target) return;
+    
+    // Đồng bộ thời gian nếu lệch > 0.1s
+    if (Math.abs(target.currentTime - source.currentTime) > 0.1) {
+      target.currentTime = source.currentTime;
+    }
+
+    // Đồng bộ trạng thái Play/Pause
+    if (source.paused && !target.paused) target.pause();
+    else if (!source.paused && target.paused) target.play();
   }, [showCompare]);
 
-  // Download stats report
+  const handleMainAction = () => syncVideos(videoRef.current!, previewVideoRef.current);
+  const handlePreviewAction = () => syncVideos(previewVideoRef.current!, videoRef.current);
+
   function downloadReport() {
     if (!r) return;
     const text = buildStatsReport(r);
@@ -161,7 +170,6 @@ export default function ResultPanel(props: {
       <div className="warn" style={{ textAlign: "center" }}>{props.errorMsg}</div>
     ) : null;
 
-    // Show preview video if available, otherwise placeholder
     if (props.previewUrl) {
       return (
         <div className="stack">
@@ -198,23 +206,33 @@ export default function ResultPanel(props: {
   const fakeColor = getFakeColor();
   const realColor = getRealColor();
 
+  const totalLine =
+    r.frames_total != null
+      ? <div style={{ fontSize: "0.9rem", fontWeight: 500 }}>Tổng: <b>{r.frames_total}</b> khung hình có khuôn mặt</div>
+      : null;
+
   const framesLine =
     r.frames_total != null && r.fake_frames != null && r.fake_ratio != null
       ? (() => {
           const realFrames = r.frames_total - r.fake_frames;
           const realRatio = 1 - r.fake_ratio;
           return (
-            <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", fontSize: "0.9rem", fontWeight: 500 }}>
-              <span>Tổng: <b>{r.frames_total}</b> khung hình</span>
-              <span style={{ color: fakeColor }}>Giả: <b>{r.fake_frames}</b> ({(r.fake_ratio * 100).toFixed(1)}%)</span>
+            <div style={{ display: "flex", gap: "1rem", flexWrap: "wrap", fontSize: "0.9rem", fontWeight: 500, alignItems: "center" }}>
+              <span style={{ color: "var(--text-secondary)", fontWeight: 400 }}>Kết quả sau khi phân tích:</span>
+              <span style={{ color: fakeColor }}>Có Deepfake: <b>{r.fake_frames}</b> ({(r.fake_ratio * 100).toFixed(1)}%)</span>
               <span style={{ color: realColor }}>Thật: <b>{realFrames}</b> ({(realRatio * 100).toFixed(1)}%)</span>
+              {r.explanation_basic && (
+                <span className="warn-badge">
+                  ⚠️ Cảnh báo: Có dấu hiệu của Deepfake (tỉ lệ Deepfake vượt quá 75%)
+                </span>
+              )}
             </div>
           );
         })()
       : null;
 
   const rows = r.method_rows_total?.length ? r.method_rows_total : r.method_rows_fake?.length ? r.method_rows_fake : r.method_rows || [];
-  const title = r.method_rows_total?.length ? "Các loại kỹ thuật Deepfake được sử dụng" : r.method_rows_fake?.length ? "Phân bố phương pháp (khung hình giả)" : "Phân bố phương pháp";
+  const title = r.method_rows_total?.length ? "Các loại kỹ thuật Deepfake phát hiện được" : r.method_rows_fake?.length ? "Phân bố phương pháp (khung hình giả)" : "Phân bố phương pháp";
   const tags: string[] = r.frame_tags || [];
   const totalFrames = typeof r.frames_total === "number" ? r.frames_total : tags?.length || 0;
   const cmap = buildColorMap(tags);
@@ -225,22 +243,30 @@ export default function ResultPanel(props: {
     <div className="stack">
       <div className="section-title">Kết quả</div>
 
-      {/* Compare mode or single video */}
       {showCompare && props.previewUrl ? (
-        <div>
-          <div className="compare-grid">
-            <div className="compare-col">
-              <div className="compare-label">Video gốc</div>
-              <video ref={previewVideoRef} src={props.previewUrl} controls onPlay={syncPlay} />
-            </div>
-            <div className="compare-col">
-              <div className="compare-label">Đã phân tích</div>
-              <video ref={videoRef} src={r.video_url} controls />
-            </div>
+        <div className="compare-grid">
+          <div className="compare-col">
+            <div className="compare-label">Video đã tải lên</div>
+            <video 
+              ref={previewVideoRef} 
+              src={props.previewUrl} 
+              controls 
+              onPlay={handlePreviewAction}
+              onPause={handlePreviewAction}
+              onSeeked={handlePreviewAction}
+            />
           </div>
-          <button className="btn small btn-ghost" style={{ marginTop: "0.5rem" }} onClick={() => setShowCompare(false)}>
-            Ẩn so sánh
-          </button>
+          <div className="compare-col">
+            <div className="compare-label">Video đã phân tích</div>
+            <video 
+              ref={videoRef} 
+              src={r.video_url} 
+              controls 
+              onPlay={handleMainAction}
+              onPause={handleMainAction}
+              onSeeked={handleMainAction}
+            />
+          </div>
         </div>
       ) : (
         <video ref={videoRef} src={r.video_url} className="media" controls />
@@ -254,24 +280,15 @@ export default function ResultPanel(props: {
           onChange={(e) => setRate(parseFloat(e.target.value))} style={{ width: "12rem" }} />
       </div>
 
-      {framesLine}
+      {totalLine}
 
       {analyzedLabel && <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>{analyzedLabel}</div>}
 
-      {typeof r.threshold_used === "number" && (
-        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Ngưỡng đã sử dụng: <b>{r.threshold_used.toFixed(3)}</b></div>
-      )}
-      {r.detector_backend_used && (
-        <div style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Bộ phát hiện khuôn mặt: <b>{r.detector_backend_used}</b></div>
-      )}
-      {r.thr_override_ignored && (
-        <div className="warn">Đang có nhiều hơn 1 mô hình phân tích được bật.</div>
-      )}
+      {framesLine}
 
-      {/* Timeline */}
       {totalFrames > 0 && tags?.length === totalFrames ? (
-        <div className="stack">
-          <div className="section-title">Dòng thời gian phân bổ khung hình của video</div>
+        <details className="stack">
+          <summary className="section-title" style={{ cursor: "pointer", listStyle: "none", outline: "none" }}>Dòng thời gian phân bổ khung hình của video</summary>
           <div style={{ display: "flex", alignItems: "stretch", height: "1rem", borderRadius: "0.5rem", overflow: "hidden", background: "var(--surface-3)", border: "1px solid var(--border-subtle)" }}
             title="Dòng thời gian theo từng khung hình">
             {tags.map((t, i) => (
@@ -304,76 +321,84 @@ export default function ResultPanel(props: {
             );
           })()}
 
-          <div style={{ display: "flex", gap: "0.9rem", flexWrap: "wrap", marginTop: "0.25rem" }}>
-            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.82rem" }}>
-              <span style={{ width: "0.65rem", height: "0.65rem", background: realColor, borderRadius: 3, display: "inline-block" }} />
-              <span style={{ color: "var(--text-secondary)" }}>Thật</span>
-            </div>
-            {Object.entries(cmap).filter(([k]) => k !== "Real").map(([k, color]) => (
-              <div key={k} style={{ display: "flex", alignItems: "center", gap: "0.4rem", fontSize: "0.82rem" }}>
-                <span style={{ width: "0.65rem", height: "0.65rem", background: color, borderRadius: 3, display: "inline-block" }} />
-                <span style={{ color: "var(--text-secondary)" }}>{k}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+
+        </details>
       ) : null}
 
-      {/* Method table */}
-      {rows?.length ? (
-        <div className="stack">
-          <div className="section-title">{title}</div>
-          <table className="pretty">
-            <thead><tr><th>Kỹ Thuật</th><th style={{ width: "6rem" }}>Tỷ lệ</th><th></th></tr></thead>
-            <tbody>
-              {rows.map(([m, p], i) => (
-                <tr key={i}>
-                  <td style={{ fontWeight: 500 }}>{m}</td>
-                  <td>{typeof p === "number" ? p.toFixed(1) : p}%</td>
-                  <td><div className="bar"><span style={{ width: `${Math.max(0, Math.min(100, Number(p)))}%` }} /></div></td>
+      <div className={(rows?.length && r.explanation_basic) ? "explanation-layout" : "stack"}>
+        {rows?.length ? (
+          <details className="stack">
+            <summary className="section-title" style={{ cursor: "pointer", listStyle: "none", outline: "none" }}>
+              {title}
+            </summary>
+            <table className="pretty">
+              <thead>
+                <tr>
+                  <th>Kỹ Thuật</th>
+                  <th className="col-ratio">Tỷ lệ</th>
+                  <th className="col-bar"></th> 
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : null}
+              </thead>
+              <tbody>
+                {rows.map(([m, p], i) => {
+                  const methodColor = cmap[m] ?? null;
+                  return (
+                    <tr key={i}>
+                      <td style={{ fontWeight: 500, whiteSpace: "nowrap" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                          {methodColor && (
+                            <span style={{ width: "0.7rem", height: "0.7rem", background: methodColor, borderRadius: 3, display: "inline-block", flexShrink: 0 }} />
+                          )}
+                          {m}
+                        </div>
+                      </td>
+                      <td className="col-ratio">
+                        {typeof p === "number" ? p.toFixed(1) : p}%
+                      </td>
+                      <td className="col-bar">
+                        <div className="bar">
+                          <span style={{ width: `${Math.max(0, Math.min(100, Number(p)))}%`, background: methodColor || "var(--border-subtle)" }} />
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </details>
+        ) : null}
 
-      {/* Explanation */}
-      {r.explanation_basic && (
-        <div className="stack">
-          <div className="section-title">Giải thích Về {r.explanation_basic.method}</div>
-          <div style={{ fontSize: "0.9rem", lineHeight: 1.7, color: "var(--text-secondary)" }}>
-            <p>
-              Kỹ thuật <b style={{ color: "var(--text)" }}>{r.explanation_basic.method}</b> chiếm{" "}
-              <b style={{ color: "var(--text)" }}>{r.explanation_basic.method_share.toFixed(1)}%</b> số khung
-              hình (tính trên toàn bộ video), tỷ lệ tổng số khung hình bị phát hiện là giả chiếm{" "}
-              <b style={{ color: "var(--text)" }}>{((r.explanation_basic.fake_ratio ?? r.fake_ratio ?? 0) * 100).toFixed(1)}%</b>.
-            </p>
-            <p>{r.explanation_basic.summary}</p>
-            <ul style={{ paddingLeft: "1.2rem" }}>
-              {r.explanation_basic.artifacts.map(([name, desc]) => (
-                <li key={name} style={{ marginBottom: "0.25rem" }}>
-                  <b style={{ color: "var(--text)" }}>{name}:</b> {desc}
-                </li>
-              ))}
-            </ul>
-          </div>
-        </div>
-      )}
+        {r.explanation_basic && (
+          <details className="stack">
+            <summary className="section-title" style={{ cursor: "pointer", listStyle: "none", outline: "none" }}>
+              Giải thích Về {r.explanation_basic.method}
+            </summary>
+            <div style={{ fontSize: "0.9rem", lineHeight: 1.7, color: "var(--text-secondary)", marginTop: "0.5rem" }}>
+              <p>
+                Kỹ thuật <b style={{ color: "var(--text)" }}>{r.explanation_basic.method}</b> chiếm{" "}
+                <b style={{ color: "var(--text)" }}>{r.explanation_basic.method_share.toFixed(1)}%</b> số khung hình.
+              </p>
+              <p>{r.explanation_basic.summary}</p>
+              <ul style={{ paddingLeft: "1.2rem" }}>
+                {r.explanation_basic.artifacts.map(([name, desc]) => (
+                  <li key={name} style={{ marginBottom: "0.25rem" }}>
+                    <b style={{ color: "var(--text)" }}>{name}:</b> {desc}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </details>
+        )}
+      </div>
 
-      {/* Action buttons */}
       <div className="actions">
         <a className="btn small" href={r.video_url} download>Tải video đã phân tích</a>
         <button className="btn small btn-ghost" onClick={downloadReport}>Tải báo cáo thống kê</button>
         {props.previewUrl && (
           <button className="btn small btn-ghost" onClick={() => setShowCompare(!showCompare)}>
-            {showCompare ? "Ẩn so sánh" : "So sánh gốc / đã phân tích"}
+            {showCompare ? "Ẩn so sánh" : "So sánh Video đã tải lên / đã phân tích"}
           </button>
         )}
-        <button className="btn small btn-ghost"
-          onClick={() => navigator.clipboard?.writeText(window.location.origin + r.video_url)}>
-          Sao chép liên kết
-        </button>
       </div>
     </div>
   );

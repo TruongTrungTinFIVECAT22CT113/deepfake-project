@@ -12,16 +12,6 @@ export default function Footer(): JSX.Element {
             <div className="footer-label">Phiên bản</div>
             <div>v{APP_VERSION}</div>
           </div>
-          <div className="footer-section">
-            <div className="footer-label">Liên hệ / Hỗ trợ</div>
-            <div className="footer-links">
-              <a href="mailto:support@deepfakedetect.local">Email hỗ trợ</a>
-              <span className="footer-sep">·</span>
-              <a href="https://github.com" target="_blank" rel="noopener noreferrer">GitHub</a>
-              <span className="footer-sep">·</span>
-              <a href="https://discord.gg" target="_blank" rel="noopener noreferrer">Discord</a>
-            </div>
-          </div>
         </div>
 
         {/* Hàng 2: Công nghệ */}
@@ -32,13 +22,12 @@ export default function Footer(): JSX.Element {
 
         {/* Disclaimer */}
         <div className="footer-disclaimer">
-          Lưu ý: Kết quả phân tích mang tính tham khảo. AI không chính xác 100% 
-          — không thay thế giám định chuyên môn.
+          Lưu ý: Kết quả phân tích mang tính tham khảo. không thể chính xác 100%
         </div>
 
         {/* Bản quyền */}
         <div className="footer-copyright">
-          © {new Date().getFullYear()} Deepfake Detect. Mọi quyền được bảo lưu.
+          © {new Date().getFullYear()}
         </div>
       </div>
     </footer>

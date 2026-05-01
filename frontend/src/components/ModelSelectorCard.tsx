@@ -11,11 +11,18 @@ export default function ModelSelectorCard({
   const enabledCount = models.filter((m) => m.enabled).length;
 
   return (
-    <div className="stack">
-      <div className="section-title">Danh Sách Các Mô Hình</div>
-      <div className="help" style={{ marginTop: -8 }}>
-        Tùy chọn các mô hình bằng Checkbox.
-      </div>
+    <details className="stack" open> 
+      <summary className="section-title" style={{ cursor: "pointer", listStyle: "none", outline: "none" }}>
+        Danh Sách Các Mô Hình
+      </summary>
+
+      {/* Hiển thị cảnh báo ngay tại danh sách chọn mô hình */}
+      {enabledCount > 1 && (
+        <div className="warn" style={{ marginTop: "0.5rem" }}>
+          Đang có lớn hơn 1 mô hình được bật.
+        </div>
+      )}
+
       <div className="model-list">
         {models.map((m) => {
           const onlyOneLeft = enabledCount === 1 && m.enabled;
@@ -45,6 +52,6 @@ export default function ModelSelectorCard({
       <div className="help">
         Cần ít nhất 1 mô hình được bật.
       </div>
-    </div>
+    </details>
   );
 }

@@ -169,98 +169,76 @@ export default function AnalyzerForm({
       </div>
 
       {/* Cài đặt nâng cao */}
-      <details className="card">
-        <summary>Cài đặt nâng cao</summary>
-        <div className="stack">
-          {/* Khoảng thời gian phân tích */}
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Khoảng thời gian</div>
-            <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-                <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>Từ</span>
-                <input type="number" min={0} step={0.1} placeholder="Bắt đầu (s)" value={startTime}
-                  onChange={(e) => setStartTime(e.target.value)} style={{ width: "7rem" }} />
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-                <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)" }}>đến</span>
-                <input type="number" min={0} step={0.1} placeholder="Kết thúc (s)" value={endTime}
-                  onChange={(e) => setEndTime(e.target.value)} style={{ width: "7rem" }} />
-              </div>
-              <span className="help">Để trống = phân tích toàn bộ video</span>
-            </div>
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Giao diện</div>
-            <div className="segmented" role="group" aria-label="Chế độ giao diện">
-              {THEME_OPTIONS.map((t) => (
-                <button key={t.id} type="button" aria-pressed={theme === t.id} onClick={() => setTheme(t.id)}>{t.label}</button>
-              ))}
-            </div>
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Bộ phát hiện khuôn mặt</div>
-            <div>
-              <div className="segmented" role="group" aria-label="Bộ phát hiện">
-                <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={() => setDetectorBackend("retinaface")}>RetinaFace (GPU)</button>
-                <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={() => setDetectorBackend("mediapipe")}>MediaPipe (CPU)</button>
-              </div>
-              <div className="help" style={{ marginTop: "0.4rem" }}>
-                Dùng để phát hiện khuôn mặt đối tượng.
-              </div>
-            </div>
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Tỷ lệ khung viền</div>
-            <div>
-              <input type="number" step={0.01} min={0.1} max={2.0} value={bboxScale}
-                onChange={(e) => setBboxScale(parseFloat(e.target.value || "1.10"))} />
-              <div className="help" style={{ marginTop: "0.4rem" }}>
-                Giá trị càng nhỏ càng sát mặt, càng lớn càng bao quát.
-              </div>
-            </div>
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Độ dày khung viền</div>
-            <input type="number" min={1} max={8} value={thickness}
-              onChange={(e) => setThickness(parseInt(e.target.value || "3"))} />
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Ghi đè ngưỡng</div>
-            <div>
-              <input type="number" step={0.001} min={0} max={1} placeholder="0.00 – 1.00"
-                value={thrOverride} onChange={(e) => setThrOverride(e.target.value)} disabled={isMultiModel} />
-              {isMultiModel && (
-                <div className="help" style={{ marginTop: "0.4rem" }}>
-                  Không khả dụng khi nhiều mô hình đang chạy.
-                </div>
-              )}
-            </div>
-          </div>
-
-          <div className="row">
-            <div style={{ fontWeight: 500 }}>Grad-CAM</div>
-            <div className="segmented" role="group" aria-label="Bật/tắt Grad-CAM">
-              <button type="button" aria-pressed={xaiMode === "none"} onClick={() => setXaiMode("none")}>Tắt</button>
-              <button type="button" aria-pressed={xaiMode === "full"} onClick={() => setXaiMode("full")}>Bật</button>
-            </div>
-          </div>
-
-          {xaiMode === "full" && (
-            <div className="row">
-              <div style={{ fontWeight: 500 }}>Bản đồ nhiệt</div>
-              <select value={xaiModelId} onChange={(e) => setXaiModelId(e.target.value)} style={{ maxWidth: "16rem" }}>
-                <option value="auto">Tự động (mô hình bật đầu tiên)</option>
-                {enabledModels.map((m) => (<option key={m.id} value={m.id}>{m.name || m.id}</option>))}
-              </select>
-            </div>
-          )}
+<details className="card">
+  <summary>Cài đặt nâng cao</summary>
+  <div className="settings-split-layout"> {/* Sử dụng class layout mới ở đây */}
+    
+    {/* CỘT BÊN TRÁI */}
+    <div className="stack">
+      <div className="row" data-tooltip="Để trống = phân tích toàn bộ video">
+        <div style={{ fontWeight: 500 }}>Khoảng thời gian</div>
+        <div style={{ display: "flex", gap: "0.75rem", alignItems: "center", flexWrap: "wrap" }}>
+          <input type="number" placeholder="Từ (s)" value={startTime} onChange={(e) => setStartTime(e.target.value)} />
+          <input type="number" placeholder="Đến (s)" value={endTime} onChange={(e) => setEndTime(e.target.value)} />
         </div>
-      </details>
+      </div>
+
+      <div className="row" data-tooltip="Màu sắc và độ tương phản.">
+        <div style={{ fontWeight: 500 }}>Giao diện</div>
+        <div className="segmented">
+          {THEME_OPTIONS.map((t) => (
+            <button key={t.id} type="button" aria-pressed={theme === t.id} onClick={() => setTheme(t.id)}>{t.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div className="row" data-tooltip="Dùng để nhận diện khuôn mặt đối tượng.">
+        <div style={{ fontWeight: 500 }}>Phần nhận diện khuôn mặt</div>
+        <div className="segmented">
+          <button type="button" aria-pressed={detectorBackend === "retinaface"} onClick={() => setDetectorBackend("retinaface")}>RetinaFace</button>
+          <button type="button" aria-pressed={detectorBackend === "mediapipe"} onClick={() => setDetectorBackend("mediapipe")}>MediaPipe</button>
+        </div>
+      </div>
+
+      {xaiMode === "full" && (
+        <div className="row">
+          <div style={{ fontWeight: 500 }}>Mô hình vẽ bản đồ nhiệt</div>
+          <select value={xaiModelId} onChange={(e) => setXaiModelId(e.target.value)}>
+            <option value="auto">Mô hình đầu trong danh sách</option>
+            {enabledModels.map((m) => (<option key={m.id} value={m.id}>{m.name || m.id}</option>))}
+          </select>
+        </div>
+      )}
+    </div>
+
+    {/* CỘT BÊN PHẢI */}
+    <div className="stack">
+      <div className="row" data-tooltip="Giá trị càng nhỏ càng sát mặt, càng lớn càng bao quát.">
+        <div style={{ fontWeight: 500 }}>Tỷ lệ khung viền</div>
+        <input type="number" step={0.01} value={bboxScale} onChange={(e) => setBboxScale(parseFloat(e.target.value))} />
+      </div>
+
+      <div className="row" data-tooltip="Độ dày của khung viền khoanh vùng khuôn mặt.">
+        <div style={{ fontWeight: 500 }}>Độ dày khung viền</div>
+        <input type="number" min={1} max={8} value={thickness} onChange={(e) => setThickness(parseInt(e.target.value))} />
+      </div>
+
+      <div className="row" data-tooltip={isMultiModel ? "Không khả dụng khi nhiều mô hình đang chạy." : ""}>
+        <div style={{ fontWeight: 500 }}>Ghi đè ngưỡng</div>
+        <input type="number" step={0.001} placeholder="0.00 – 1.00" value={thrOverride} onChange={(e) => setThrOverride(e.target.value)} disabled={isMultiModel} />
+      </div>
+
+      <div className="row" data-tooltip="Tạo bản đồ nhiệt hiển thị sự chú ý của mô hình.">
+        <div style={{ fontWeight: 500 }}>Bản đồ nhiệt</div>
+        <div className="segmented">
+          <button type="button" aria-pressed={xaiMode === "none"} onClick={() => setXaiMode("none")}>Tắt</button>
+          <button type="button" aria-pressed={xaiMode === "full"} onClick={() => setXaiMode("full")}>Bật</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</details>
 
       <div>
         <button type="submit" className="btn">Phân tích video</button>
