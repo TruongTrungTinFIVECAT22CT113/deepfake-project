@@ -1,9 +1,11 @@
 import React, { useRef, useState, useEffect, useCallback } from "react";
+import { type AnalyzeResult } from "../api";
 
 type NewFields = {
   frames_total?: number;
   fake_frames?: number;
   fake_ratio?: number;
+  verdict_level?: "clean" | "suspect" | "fake";
   threshold_used?: number;
   thr_override_ignored?: boolean;
   detector_backend_used?: string;
@@ -108,7 +110,7 @@ function buildStatsReport(r: any): string {
 }
 
 export default function ResultPanel(props: {
-  result?: { verdict: string; video_url: string } & NewFields;
+  result?: AnalyzeResult | null;
   loading?: boolean;
   previewUrl?: string | null;
   previewDuration?: number | null;
@@ -184,7 +186,7 @@ export default function ResultPanel(props: {
           </div>
           <video src={props.previewUrl} className="media" controls />
           <div style={{ fontSize: "0.9rem", color: "var(--text-secondary)" }}>
-            Nhấn <b style={{ color: "var(--text)" }}>Phân tích video</b> để bắt đầu phát hiện deepfake.
+            Nhấn <b style={{ color: "var(--text)" }}>Phân tích video</b> để bắt đầu.
           </div>
         </div>
       );
@@ -221,9 +223,19 @@ export default function ResultPanel(props: {
               <span style={{ color: "var(--text-secondary)", fontWeight: 400 }}>Kết quả sau khi phân tích:</span>
               <span style={{ color: fakeColor }}>Có Deepfake: <b>{r.fake_frames}</b> ({(r.fake_ratio * 100).toFixed(1)}%)</span>
               <span style={{ color: realColor }}>Thật: <b>{realFrames}</b> ({(realRatio * 100).toFixed(1)}%)</span>
-              {r.explanation_basic && (
+              {r.verdict_level === "clean" && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", padding: "0.3rem 0.75rem", borderRadius: "0.4rem", fontSize: "0.82rem", fontWeight: 600, background: "rgba(34,197,94,0.15)", color: "#22c55e", border: "1px solid rgba(34,197,94,0.3)" }}>
+                  ✅ Không phát hiện dấu hiệu Deepfake (dưới 30%)
+                </span>
+              )}
+              {r.verdict_level === "suspect" && (
                 <span className="warn-badge">
-                  ⚠️ Cảnh báo: Có dấu hiệu của Deepfake (tỉ lệ Deepfake vượt quá 75%)
+                  ⚠️ Có dấu hiệu của Deepfake (từ 30-75%)
+                </span>
+              )}
+              {r.verdict_level === "fake" && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: "0.4rem", padding: "0.3rem 0.75rem", borderRadius: "0.4rem", fontSize: "0.82rem", fontWeight: 600, background: "rgba(239,68,68,0.15)", color: "#ef4444", border: "1px solid rgba(239,68,68,0.3)" }}>
+                  🚨 Xác nhận: là có Deepfake bên trong video (trên 75%)
                 </span>
               )}
             </div>

@@ -4,14 +4,14 @@ import Footer from "./components/Footer";
 import AnalyzerForm from "./components/AnalyzerForm";
 import ResultPanel from "./components/ResultPanel";
 import ModelSelectorCard from "./components/ModelSelectorCard";
-import { getHealth, listModels, setModelsEnabled, type ModelMeta } from "./api";
+import { getHealth, listModels, setModelsEnabled, type ModelMeta, type AnalyzeResult } from "./api";
 import { ToastProvider } from "./components/Toast";
 
 export type ThemeId = "dark" | "light" | "balanced" | "colorblind";
 
 export default function App(): JSX.Element {
   const [loading, setLoading] = useState(false);
-  const [res, setRes] = useState<any>(null);
+  const [res, setRes] = useState<AnalyzeResult | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewDuration, setPreviewDuration] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);

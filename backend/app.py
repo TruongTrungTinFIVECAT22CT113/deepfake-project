@@ -188,12 +188,32 @@ def _build_method_rows_fake(counts: Dict[str, int]) -> List[Tuple[str, float]]:
     return rows
 
 
+# Ngưỡng phán quyết
+_THR_CLEAN   = 0.30   # < 30%  → Không có dấu hiệu
+_THR_SUSPECT = 0.75   # 30–75% → Có dấu hiệu
+                       # ≥ 75%  → Xác nhận Deepfake
+
+def _get_verdict_level(fake_ratio: float) -> str:
+    """
+    Trả về mức phán quyết dựa trên tỉ lệ fake:
+      'clean'   : fake_ratio < 0.30 → Không phát hiện dấu hiệu Deepfake
+      'suspect' : 0.30 ≤ fake_ratio < 0.75 → Có dấu hiệu Deepfake
+      'fake'    : fake_ratio ≥ 0.75 → Xác nhận là Deepfake
+    """
+    if fake_ratio < _THR_CLEAN:
+        return "clean"
+    elif fake_ratio < _THR_SUSPECT:
+        return "suspect"
+    else:
+        return "fake"
+
+
 def _build_basic_explanation(
     method_rows_total: List[Tuple[str, float]],
     method_rows_fake: List[Tuple[str, float]],
     fake_ratio: float,
 ) -> Optional[Dict[str, Any]]:
-    if fake_ratio < 0.75:
+    if fake_ratio < _THR_SUSPECT:
         return None
 
     rows = method_rows_total or method_rows_fake
@@ -295,8 +315,11 @@ async def analyze(
             try: os.replace(out_path, final_path)
             except Exception: pass
 
+        verdict_level = _get_verdict_level(fake_ratio)
+
         return {
             "verdict": verdict,
+            "verdict_level": verdict_level,
             "video_url": f"/api/download/{token}/{fname}",
             "frames_total": frames_total,
             "fake_frames": fake_frames,

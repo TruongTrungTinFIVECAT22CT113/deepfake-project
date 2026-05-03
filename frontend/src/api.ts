@@ -15,6 +15,38 @@ export type ModelMeta = {
   best_thr?: number;
 };
 
+export type ArtifactEntry = [string, string];
+
+export type ExplanationBasic = {
+  method: string;
+  method_share: number;
+  fake_ratio: number;
+  summary: string;
+  artifacts: ArtifactEntry[];
+};
+
+export type AnalyzeResult = {
+  verdict: string;
+  verdict_level: "clean" | "suspect" | "fake";
+  video_url: string;
+  frames_total: number;
+  fake_frames: number;
+  fake_ratio: number;
+  fps: number;
+  duration_sec: number;
+  threshold_used: number;
+  thr_override_ignored: boolean;
+  detector_backend_used: string;
+  method_rows_total: [string, number][];
+  method_rows_fake: [string, number][];
+  method_rows: [string, number][];
+  method_distribution: Record<string, number>;
+  frame_tags: string[];
+  analyzed_start_sec: number | null;
+  analyzed_end_sec: number | null;
+  explanation_basic: ExplanationBasic | null;
+};
+
 export type AnalyzeOptions = {
   // Advanced
   detector_backend?: "retinaface" | "mediapipe";
@@ -48,7 +80,7 @@ export async function getHealth(): Promise<Health> {
 export async function listModels(): Promise<ModelMeta[]> {
   const r = await fetch(`${API_BASE}/api/models`);
   if (!r.ok) throw new Error("Failed to list models");
-  return await r.json();
+  return await r.json() as ModelMeta[];
 }
 
 /**
@@ -63,13 +95,13 @@ export async function setModelsEnabled(enabled_ids: string[]): Promise<ModelMeta
     body: JSON.stringify({ enabled_ids }),
   });
   if (!r.ok) throw new Error(await r.text());
-  return await r.json();
+  return await r.json() as ModelMeta[];
 }
 
 export async function analyzeVideo(
   file: File,
   opts: AnalyzeOptions
-): Promise<any> {
+): Promise<AnalyzeResult> {
   const fd = new FormData();
   fd.append("file", file);
 
@@ -97,5 +129,5 @@ export async function analyzeVideo(
     body: fd,
   });
   if (!r.ok) throw new Error(await r.text());
-  return await r.json();
+  return await r.json() as AnalyzeResult;
 }
