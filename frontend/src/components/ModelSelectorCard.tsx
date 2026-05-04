@@ -19,7 +19,7 @@ export default function ModelSelectorCard({
       {/* Hiển thị cảnh báo ngay tại danh sách chọn mô hình */}
       {enabledCount > 1 && (
         <div className="warn" style={{ marginTop: "0.5rem" }}>
-          Đang có lớn hơn 1 mô hình được bật.
+          Có nhiều hơn 1 mô hình được bật.
         </div>
       )}
 

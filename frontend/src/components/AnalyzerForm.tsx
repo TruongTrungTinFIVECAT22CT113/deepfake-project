@@ -7,7 +7,7 @@ const THEME_OPTIONS: { id: ThemeId; label: string }[] = [
   { id: "dark",       label: "Tối" },
   { id: "light",      label: "Sáng" },
   { id: "balanced",   label: "Cân bằng" },
-  { id: "colorblind", label: "Mù màu" },
+  //{ id: "colorblind", label: "Mù màu" },
 ];
 
 export default function AnalyzerForm({
@@ -201,10 +201,10 @@ export default function AnalyzerForm({
       </div>
 
       {xaiMode === "full" && (
-        <div className="row">
-          <div style={{ fontWeight: 500 }}>Mô hình vẽ bản đồ nhiệt</div>
+        <div className="row" data-tooltip="Mô hình dùng để vẽ Heatmap.">
+          <div style={{ fontWeight: 500 }}>Heatmap Model</div>
           <select value={xaiModelId} onChange={(e) => setXaiModelId(e.target.value)}>
-            <option value="auto">Mô hình đầu trong danh sách</option>
+            <option value="auto">Mô hình đầu từ danh sách được bật</option>
             {enabledModels.map((m) => (<option key={m.id} value={m.id}>{m.name || m.id}</option>))}
           </select>
         </div>
@@ -228,8 +228,8 @@ export default function AnalyzerForm({
         <input type="number" step={0.001} placeholder="0.00 – 1.00" value={thrOverride} onChange={(e) => setThrOverride(e.target.value)} disabled={isMultiModel} />
       </div>
 
-      <div className="row" data-tooltip="Tạo bản đồ nhiệt hiển thị sự chú ý của mô hình.">
-        <div style={{ fontWeight: 500 }}>Bản đồ nhiệt</div>
+      <div className="row" data-tooltip="Hiển thị sự chú ý của mô hình lên các vùng có dấu hiệu của Deepfake bằng Heatmap.">
+        <div style={{ fontWeight: 500 }}>Grad-CAM Heatmap</div>
         <div className="segmented">
           <button type="button" aria-pressed={xaiMode === "none"} onClick={() => setXaiMode("none")}>Tắt</button>
           <button type="button" aria-pressed={xaiMode === "full"} onClick={() => setXaiMode("full")}>Bật</button>
