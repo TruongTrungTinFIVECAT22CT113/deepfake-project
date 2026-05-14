@@ -261,7 +261,19 @@ table.pretty tr { transition: background var(--transition); }
 .bar { height: 0.5rem; background: var(--surface-3); border: 1px solid var(--border-subtle); border-radius: 999px; overflow: hidden; min-width: 120px; }
 .bar > span { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width 0.4s ease; }
 
-video.media { width: 100%; border-radius: var(--radius); outline: none; border: 1px solid var(--border); background: #000; }
+.video-wrap {
+  position: relative;
+  width: 100%;
+  max-width: 854px;
+  margin: 0 auto;
+  background: #000;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.video-wrap.portrait { max-width: 340px; }
+.video-wrap.classic  { max-width: 640px; }
+video.media { width: 100%; height: 100%; display: block; outline: none; background: #000; object-fit: contain; }
 
 /* Pill */
 .pill { display: inline-flex; align-items: center; gap: 0.3rem; padding: 0.25rem 0.65rem; border-radius: 999px; font-weight: 600; font-size: 0.78rem; border: 1px solid var(--border); }

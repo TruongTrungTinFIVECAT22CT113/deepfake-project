@@ -118,6 +118,18 @@ export default function ResultPanel(props: {
 }): JSX.Element | null {
   const r = props.result;
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [videoClass, setVideoClass] = useState<string>("");
+  const [aspectRatio, setAspectRatio] = useState<string>("16/9");
+
+  function handleVideoMeta(e: React.SyntheticEvent<HTMLVideoElement>) {
+    const v = e.currentTarget;
+    if (v.videoWidth && v.videoHeight) {
+      const ratio = v.videoWidth / v.videoHeight;
+      if (ratio < 0.8) { setVideoClass("portrait"); setAspectRatio("9/16"); }
+      else if (ratio < 1.4) { setVideoClass("classic"); setAspectRatio("4/3"); }
+      else { setVideoClass(""); setAspectRatio("16/9"); }
+    }
+  }
   const previewVideoRef = useRef<HTMLVideoElement>(null);
   const [rate, setRate] = useState(1.0);
   const [showCompare, setShowCompare] = useState(false);
@@ -184,7 +196,9 @@ export default function ResultPanel(props: {
               </span>
             ) : null}
           </div>
-          <video src={props.previewUrl} className="media" controls />
+          <div className={`video-wrap ${videoClass}`} style={{ aspectRatio }}>
+            <video src={props.previewUrl} className="media" controls onLoadedMetadata={handleVideoMeta} />
+          </div>
           <div style={{ fontSize: "0.9rem", color: "var(--text-secondary)" }}>
             Nhấn <b style={{ color: "var(--text)" }}>Phân tích video</b> để bắt đầu.
           </div>
@@ -259,29 +273,38 @@ export default function ResultPanel(props: {
         <div className="compare-grid">
           <div className="compare-col">
             <div className="compare-label">Video đã tải lên</div>
-            <video 
-              ref={previewVideoRef} 
-              src={props.previewUrl} 
-              controls 
-              onPlay={handlePreviewAction}
-              onPause={handlePreviewAction}
-              onSeeked={handlePreviewAction}
-            />
+            <div className={`video-wrap ${videoClass}`} style={{ aspectRatio }}>
+              <video
+                ref={previewVideoRef}
+                src={props.previewUrl}
+                className="media"
+                controls
+                onPlay={handlePreviewAction}
+                onPause={handlePreviewAction}
+                onLoadedMetadata={handleVideoMeta}
+                onSeeked={handlePreviewAction}
+              />
+            </div>
           </div>
           <div className="compare-col">
             <div className="compare-label">Video đã phân tích</div>
-            <video 
-              ref={videoRef} 
-              src={r.video_url} 
-              controls 
-              onPlay={handleMainAction}
-              onPause={handleMainAction}
-              onSeeked={handleMainAction}
-            />
+            <div className={`video-wrap ${videoClass}`} style={{ aspectRatio }}>
+              <video
+                ref={videoRef}
+                src={r.video_url}
+                className="media"
+                controls
+                onPlay={handleMainAction}
+                onPause={handleMainAction}
+                onSeeked={handleMainAction}
+              />
+            </div>
           </div>
         </div>
       ) : (
-        <video ref={videoRef} src={r.video_url} className="media" controls />
+        <div className={`video-wrap ${videoClass}`} style={{ aspectRatio }}>
+          <video ref={videoRef} src={r.video_url} className="media" controls onLoadedMetadata={handleVideoMeta} />
+        </div>
       )}
 
       <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
