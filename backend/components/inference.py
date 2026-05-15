@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 import os, tempfile
@@ -11,16 +10,30 @@ from torchvision import transforms
 import torch.nn as nn
 
 from .utils import draw_box_with_label_np, render_verdict_text
-from .face_detection import crop_largest_face
+from .face_detection import (
+    crop_largest_face,
+    retina_detect_batch,
+    _try_init_retinaface,
+    _try_init_mediapipe,
+    _mp_detect_all,
+    _square_crop_from_bbox,
+    _retina_det_thr,
+)
 from .xai_cam import generate_cam_vit, generate_cam_cnn, generate_cam_swin, overlay_heatmap_on_bgr
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
-ENSEMBLE_THR_DEFAULT = 0.58 
+ENSEMBLE_THR_DEFAULT = 0.58
+
+BASE_BATCH_SIZE = 48
+XAI_BATCH_SIZE  = 24
+
+# Số frame đọc vào RAM trước khi detect + infer cùng lúc.
+# Tăng nếu GPU VRAM > 8 GB, giảm nếu VRAM thấp.
+READ_AHEAD = 128
 
 
 def build_eval_transform(img_size: int):
-    # exactly like backend_eval.py: ToPILImage() expects HxWxC array; we pass BGR array as-is
     return transforms.Compose([
         transforms.ToPILImage(),
         transforms.Resize((img_size, img_size)),
@@ -30,136 +43,54 @@ def build_eval_transform(img_size: int):
 
 
 @torch.no_grad()
-def _predict_image_tensor(x_chw: torch.Tensor, model, device):
-    xb = x_chw.unsqueeze(0).to(device, non_blocking=True)
-    lb, lm, *_ = model(xb)
-    pbin = torch.softmax(lb, dim=1).squeeze(0).cpu().numpy()  # [fake_prob, real_prob] (fake_index=0)
-    pmth = torch.softmax(lm, dim=1).squeeze(0).cpu().numpy()
-    p_fake = float(pbin[0])
-    p_real = float(pbin[1]) if pbin.shape[0] > 1 else float(1.0 - p_fake)
-    return p_fake, p_real, pmth
+def _ensemble_predict_batch(detectors_info, crops_bgr, tx, method_names):
+    if not crops_bgr:
+        return [], [], None
 
+    device = detectors_info[0]["device"]
+    batch_tensors = torch.stack([tx(crop) for crop in crops_bgr]).to(device)
 
-@torch.no_grad()
-def _ensemble_predict_bgr_crop(
-    detectors_info: List[dict],
-    crop_bgr: np.ndarray,
-    tx: transforms.Compose,
-    method_names: List[str]
-):
-    p_fake_sum, p_real_sum = 0.0, 0.0
-    pm_sum = np.zeros(len(method_names), dtype=np.float64) if method_names else None
-    # We apply a single eval-style transform (same as backend_eval.py) for all models
-    x = tx(crop_bgr)  # BGR array -> ToPILImage (assumes RGB) -> (no channel swap, matching eval quirk)
+    # Tự động ép FP16 nếu model đang ở FP16
+    first_param = next(detectors_info[0]["model"].parameters())
+    if batch_tensors.dtype == torch.float32 and first_param.dtype == torch.float16:
+        batch_tensors = batch_tensors.half()
+
+    p_fake_list = []
+    pm_list = []
+
     for info in detectors_info:
-        model = info["model"]; device = info["device"]
-        pf, pr, pm = _predict_image_tensor(x, model, device)
-        p_fake_sum += pf; p_real_sum += pr
+        lb, lm, *_ = info["model"](batch_tensors)
+        pbin = torch.softmax(lb, dim=1)
+        p_fake_list.append(pbin[:, 0])
         if method_names:
-            pm_sum += pm[:len(method_names)]
-    n = max(1, len(detectors_info))
-    if method_names:
-        return p_fake_sum/n, p_real_sum/n, (pm_sum/n)
-    else:
-        return p_fake_sum/n, p_real_sum/n, np.zeros(1, dtype=np.float32)
+            pm_list.append(torch.softmax(lm, dim=1))
+
+    p_fake_avg = torch.mean(torch.stack(p_fake_list), dim=0).cpu().numpy()
+    pm_avg = torch.mean(torch.stack(pm_list), dim=0).cpu().numpy() if pm_list else None
+
+    return p_fake_avg.tolist(), None, pm_avg
 
 
-def _flush_bucket_with_cam(
-    frames: List[dict],
-    model,
-    device,
-    is_vit: bool,
-    cnn_target_layer,
-    tx,
-):
-    """Áp Grad-CAM vào 1 frame fake có p_fake cao nhất trong bucket (≈ 1 giây)."""
-    if not frames:
-        return
-    best_idx = None
-    best_p = -1.0
-    for i, rec in enumerate(frames):
-        if not rec.get("is_fake"):
-            continue
-        p = float(rec.get("p_fake") or 0.0)
-        if p > best_p:
-            best_p = p
-            best_idx = i
-    if best_idx is None:
-        return  # không có frame fake trong giây này
-
-    rec = frames[best_idx]
-    crop = rec.get("crop_bgr")
-    box = rec.get("box")
-    if crop is None or box is None:
-        return
-    x1, y1, x2, y2 = box
-
-    try:
-        x = tx(crop)  # CHW
-        x = x.unsqueeze(0).to(device, non_blocking=True)
-        if is_vit:
-            cam = generate_cam_vit(model, x, device=str(device))
-        elif cnn_target_layer is not None:
-            cam = generate_cam_cnn(model, x, target_layer=cnn_target_layer, device=str(device))
-        else:
-            return
-        heat_crop = overlay_heatmap_on_bgr(crop, cam)
-        out_bgr = rec["out_bgr"]
-        if (x2 - x1) > 0 and (y2 - y1) > 0:
-            heat_resized = cv2.resize(heat_crop, (x2 - x1, y2 - y1))
-            out_bgr[y1:y2, x1:x2] = heat_resized
-    except Exception:
-        return
-
-
-def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
-    """
-    Cố gắng đoán layer conv cuối cùng để dùng cho Grad-CAM CNN.
-    Ưu tiên:
-      - ConvNeXt: backbone.stages[-1][-1]
-      - EfficientNet-like: backbone.blocks[-2] (hook sớm hơn để map lan rộng hơn)
-      - ResNet-like: layer4 / layers4 / block4 / stage4
-      - Fallback: conv2d cuối cùng trong model
-    """
-    # 1) ConvNeXt: timm ConvNeXt có thuộc tính .stages
-    if hasattr(backbone, "stages"):
+def _guess_cnn_target_layer(backbone: nn.Module):
+    if "convnext" in backbone.__class__.__name__.lower():
         try:
-            stages = backbone.stages
-            if hasattr(stages, "__len__") and len(stages) > 0:
-                last_stage = stages[-1]
-                if hasattr(last_stage, "__len__") and len(last_stage) > 0:
-                    return last_stage[-1]
-                return last_stage
+            return backbone.stages[-1][-1]
         except Exception:
             pass
-
-    # 1b) EfficientNet / RegNet / ...: thường có thuộc tính .blocks (nhưng vẫn là CNN)
     if hasattr(backbone, "blocks"):
         try:
-            blocks = backbone.blocks
-            if hasattr(blocks, "__len__") and len(blocks) > 0:
-                cls_name = backbone.__class__.__name__.lower()
-                # EfficientNet: blocks[-2] — discriminative nhất, oval mask lo phần còn lại
-                if "efficientnet" in cls_name and len(blocks) >= 2:
-                    idx = len(blocks) - 2
-                else:
-                    idx = len(blocks) - 1
-                last_block = blocks[idx]
-                if hasattr(last_block, "__len__") and len(last_block) > 0:
-                    return last_block[-1]
-                return last_block
+            return backbone.blocks[-1]
         except Exception:
             pass
-
-    # 2) Các backbone kiểu ResNet / tương tự
-    for attr in ["layer4", "layers4", "block4", "stage4"]:
+    for attr in ["layer4", "layers4", "stage4", "block4"]:
         if hasattr(backbone, attr):
-            layer = getattr(backbone, attr)
-            if hasattr(layer, "__len__") and len(layer) > 0:
-                return layer[-1]
-            return layer
-
-    # 3) Fallback: đi tìm conv2d cuối cùng trong model
+            try:
+                layer = getattr(backbone, attr)
+                if hasattr(layer, "__len__") and len(layer) > 0:
+                    layer = layer[-1]
+                return layer
+            except Exception:
+                pass
     last_conv = None
     for m in backbone.modules():
         if isinstance(m, nn.Conv2d):
@@ -167,271 +98,320 @@ def _guess_cnn_target_layer(backbone: nn.Module) -> nn.Module | None:
     return last_conv
 
 
+def _detect_faces_batch(
+    bgr_frames: List[np.ndarray],
+    backend: str,
+    device_type: str,
+    det_thr: float,
+    det_size: int,
+    bbox_scale: float,
+    allow_fallback: bool,
+) -> List[Optional[Tuple[int, int, int, int, np.ndarray]]]:
+    """
+    Detect mặt cho một batch frame cùng lúc.
+    Trả về list: mỗi phần tử là (x1,y1,x2,y2, crop_bgr) hoặc None nếu không detect được.
+    """
+    backend = (backend or "retinaface").strip().lower()
+    n = len(bgr_frames)
+    results: List[Optional[Tuple]] = [None] * n
+
+    if backend == "retinaface":
+        _try_init_retinaface(device_type=device_type, det_size=det_size, det_thr=det_thr)
+        bboxes = retina_detect_batch(bgr_frames)          # true batch (hoặc fallback serial)
+    else:
+        # MediaPipe: không có batch API → chạy serial (nhanh hơn RetinaFace serial vì model nhỏ hơn)
+        _try_init_mediapipe()
+        bboxes = []
+        for bgr in bgr_frames:
+            dets = _mp_detect_all(bgr)
+            if dets:
+                dets.sort(key=lambda t: (t[2] - t[0]) * (t[3] - t[1]), reverse=True)
+                x1, y1, x2, y2, _ = dets[0]
+                bboxes.append((x1, y1, x2, y2))
+            else:
+                bboxes.append(None)
+
+    for idx, (bgr, bb) in enumerate(zip(bgr_frames, bboxes)):
+        if bb is None:
+            if allow_fallback:
+                # Thử backend kia
+                try:
+                    pil = Image.fromarray(bgr[:, :, ::-1].copy())
+                    _, box, _ = crop_largest_face(
+                        pil,
+                        backend=("mediapipe" if backend == "retinaface" else "retinaface"),
+                        device=device_type, det_thr=det_thr, det_size=det_size,
+                        bbox_scale=bbox_scale, allow_fallback=False,
+                    )
+                    x1, y1, x2, y2 = map(int, box)
+                    crop = bgr[max(0, y1):y2, max(0, x1):x2]
+                    if crop.size > 0:
+                        results[idx] = (x1, y1, x2, y2, crop)
+                except Exception:
+                    pass
+            continue
+
+        crop_info = _square_crop_from_bbox(bgr, bb, scale=bbox_scale)
+        if crop_info is None:
+            continue
+        crop_bgr, box_scaled = crop_info
+        h_f, w_f = bgr.shape[:2]
+        x1 = max(0, box_scaled[0]); y1 = max(0, box_scaled[1])
+        x2 = min(w_f, box_scaled[2]); y2 = min(h_f, box_scaled[3])
+        crop_clipped = bgr[y1:y2, x1:x2]
+        if crop_clipped.size > 0:
+            results[idx] = (x1, y1, x2, y2, crop_clipped)
+
+    return results
+
+
 def analyze_video(
     video_path: str,
     detectors_info: List[dict],
     method_names: List[str],
-    # FE threshold override (honored only when a single model is enabled)
     fe_thr_override: Optional[float],
-    # detector backend prefs
     detector_backend: str = "retinaface",
     bbox_scale: float = 1.10,
     det_thr: float = 0.5,
-    # viz
     box_thickness: int = 3,
-    # strict fallback control (match eval by default)
     allow_fallback: bool = False,
     xai_mode: str = "none",
-    # index của model được FE chọn để vẽ CAM (trong danh sách detectors_info)
     xai_primary_index: Optional[int] = None,
 ):
-    # ---------- choose threshold ----------
-    if len(detectors_info) <= 0:
+    if not detectors_info:
         return None, "No enabled model.", {}, ""
 
     if len(detectors_info) == 1:
-        thr_used = float(fe_thr_override) if (fe_thr_override is not None) else float(detectors_info[0].get("best_thr", 0.5))
-        thr_override_ignored = False
+        thr_used = float(fe_thr_override) if fe_thr_override is not None else float(detectors_info[0].get("best_thr", 0.5))
         img_size = int(detectors_info[0].get("img_size", 384))
     else:
         thr_used = ENSEMBLE_THR_DEFAULT
-        thr_override_ignored = True
         img_size = int(detectors_info[0].get("img_size", 384))
 
     tx = build_eval_transform(img_size)
 
-    # ---------- open video ----------
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        cap = cv2.VideoCapture(video_path, apiPreference=cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            return None, "Cannot open video.", {}, ""
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    try:
-        fps = float(fps)
-        if not np.isfinite(fps) or fps <= 0: fps = 25.0
-    except Exception:
-        fps = 25.0
-    if w <= 0 or h <= 0:
-        cap.release()
-        return None, "Invalid video.", {}, ""
-
-    # ---------- writer ----------
     tmpdir = tempfile.mkdtemp(prefix="df_web_")
     out_path = os.path.join(tmpdir, "out.mp4")
-    use_imageio = False
+
     try:
         import imageio.v2 as imageio
         writer = imageio.get_writer(out_path, fps=fps, codec="libx264", quality=7)
         use_imageio = True
-        vout = None
     except Exception:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        vout = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
-        writer = None
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+        use_imageio = False
 
-    # ---------- loop ----------
-    requested_backend = (detector_backend or "retinaface").strip().lower()
-
-    frames_total = 0
-    fake_frames = 0
+    frames_total = fake_frames = 0
     mnames = list(method_names or [])
     m_count = {m: 0 for m in mnames}
     backend_used_final = None
-    frame_tags: List[str] = []  # NEW: per-frame label ("Real" or method name)
+    frame_tags: List[str] = []
 
-    # ---------- XAI / Grad-CAM mode ----------
-    xai_mode = (xai_mode or "none").lower()
-    enable_xai = xai_mode in ("single", "full")
+    enable_xai = (xai_mode or "none").lower() in ("single", "full")
+    batch_size = XAI_BATCH_SIZE if enable_xai else BASE_BATCH_SIZE
+    # READ_AHEAD phải ≥ batch_size để lấp đầy batch tốt nhất
+    read_ahead = max(READ_AHEAD, batch_size)
 
-    primary_info: Optional[dict] = None
-    primary_model = None
-    primary_device = None
-    is_vit = False
-    is_swin = False
+    # ── Setup XAI ──────────────────────────────────────────────
+    primary_info = primary_model = primary_device = None
+    is_vit = is_swin = False
     cnn_target_layer = None
 
-    if enable_xai and len(detectors_info) > 0:
-        # Nếu FE chọn model cụ thể cho XAI -> ưu tiên
+    if enable_xai and detectors_info:
         if xai_primary_index is not None and 0 <= xai_primary_index < len(detectors_info):
             primary_info = detectors_info[xai_primary_index]
         else:
-            # fallback: ưu tiên Transformer (ViT / Swin) nếu có
             for info in detectors_info:
-                arch_type = str(info.get("arch_type", "cnn"))
-                if arch_type in ("vit", "swin"):
+                if str(info.get("arch_type", "")).lower() in ("vit", "swin"):
                     primary_info = info
                     break
-            if primary_info is None:
+            if not primary_info:
                 primary_info = detectors_info[0]
 
-        primary_model = primary_info["model"]
+        primary_model  = primary_info["model"]
         primary_device = primary_info["device"]
         arch_type = str(primary_info.get("arch_type", "cnn")).lower()
-
-        backbone = getattr(primary_model, "backbone", primary_model)
         if arch_type == "vit":
             is_vit = True
         elif arch_type == "swin":
             is_swin = True
         else:
-            cnn_target_layer = _guess_cnn_target_layer(backbone)
-    else:
-        # tắt XAI, nhưng vẫn gán primary_model để code phía dưới không bị NameError
-        enable_xai = False
-        if len(detectors_info) > 0:
-            primary_info = detectors_info[0]
-            primary_model = primary_info["model"]
-            primary_device = primary_info["device"]
+            cnn_target_layer = _guess_cnn_target_layer(
+                getattr(primary_model, "backbone", primary_model)
+            )
+
+    device_type_str = str(detectors_info[0]["device"].type)
+
+    # ── Vòng lặp chính: đọc READ_AHEAD frame → detect batch → infer batch ──
+    def _read_chunk(cap, n) -> List[np.ndarray]:
+        """Đọc tối đa n frame từ cap, trả về list BGR."""
+        chunk = []
+        for _ in range(n):
+            ret, frm = cap.read()
+            if not ret:
+                break
+            chunk.append(frm)
+        return chunk
 
     while True:
-        ok, frame_bgr = cap.read()
-        if not ok:
+        chunk_bgr = _read_chunk(cap, read_ahead)
+        if not chunk_bgr:
             break
-        frames_total += 1
 
-        # strict: largest face by requested backend
-        # NOTE: crop_largest_face returns (PIL-crop, box, backend_used), but to match eval we rebuild BGR crop from box.
-        try:
-            _, box, backend_used = crop_largest_face(
-                Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)),  # only for detector; we'll use frame_bgr + box for crop
-                backend=requested_backend,
-                device=detectors_info[0]["device"].type if hasattr(detectors_info[0]["device"], "type") else "cuda",
-                det_thr=float(det_thr),
-                det_size=640,
-                bbox_scale=float(bbox_scale),
-                allow_fallback=allow_fallback,
-            )
-        except Exception:
-            # if detector fails and no fallback: behave like eval (ok=False) => don't increment fake; still count frame
-            frame_tags.append("Real")
-            continue
+        frames_total += len(chunk_bgr)
 
-        if backend_used_final is None:
-            backend_used_final = backend_used
-
-        x1,y1,x2,y2 = [int(v) for v in box]
-        # rebuild BGR crop exactly like backend_eval.square_crop_from_bbox
-        crop_bgr = frame_bgr[max(0,y1):min(h,y2), max(0,x1):min(w,x2)]
-        if crop_bgr.size == 0:
-            frame_tags.append("Real")
-            continue
-
-        pf, pr, pm = _ensemble_predict_bgr_crop(detectors_info, crop_bgr, tx, mnames)
-        is_fake = (pf >= thr_used)
-        if is_fake:
-            fake_frames += 1
-            if len(mnames) > 0:
-                m_idx = int(np.argmax(pm))
-                m_count[mnames[m_idx]] += 1
-                frame_tags.append(mnames[m_idx])
-            else:
-                frame_tags.append("Fake")
-        else:
-            frame_tags.append("Real")
-
-        # draw box+label on RGB frame for output video only
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        if is_fake and len(mnames) > 0:
-            m_idx = int(np.argmax(pm))
-            label = mnames[m_idx]
-        else:
-            label = "Real"
-
-        draw_box_with_label_np(
-            frame_rgb, [x1,y1,x2,y2], label,
-            color=(223,64,64) if is_fake else (64,208,120),
-            thickness=int(box_thickness)
+        # ── 1. Detect mặt cho cả chunk (true batch với RetinaFace) ──
+        det_results = _detect_faces_batch(
+            chunk_bgr,
+            backend=detector_backend,
+            device_type=device_type_str,
+            det_thr=det_thr,
+            det_size=640,
+            bbox_scale=bbox_scale,
+            allow_fallback=allow_fallback,
         )
-        out_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+        if backend_used_final is None:
+            backend_used_final = detector_backend  # ghi nhận lần đầu
 
-        if enable_xai and crop_bgr is not None and primary_model is not None:
-            try:
-                x = tx(crop_bgr)  # CHW
-                x = x.unsqueeze(0).to(primary_device, non_blocking=True)
+        # ── 2. Tách frame có mặt / không có mặt ──
+        # face_items: (chunk_idx, frame_bgr, x1,y1,x2,y2, crop_bgr)
+        face_items = []
+        no_face_indices = []
+        for ci, (frm, det) in enumerate(zip(chunk_bgr, det_results)):
+            if det is None:
+                no_face_indices.append(ci)
+            else:
+                x1, y1, x2, y2, crop = det
+                face_items.append((ci, frm, x1, y1, x2, y2, crop))
 
-                # LUÔN dùng lớp "fake" (index=0) làm target cho Grad-CAM
-                target_idx = 0
+        # ── 3. Inference batch theo batch_size ──
+        # Kết quả: infer_results[ci] = (p_fake, label, p_methods_row)
+        infer_results: Dict[int, Tuple[float, str, Optional[np.ndarray]]] = {}
 
-                if is_vit:
-                    # smooth_output=True cho BEiT để blur heatmap phân mảnh
-                    _is_beit = "beit" in str(primary_info.get("model_name", "")).lower()
-                    cam = generate_cam_vit(
-                        primary_model,
-                        x,
-                        target_index=target_idx,
-                        device=str(primary_device),
-                        smooth_output=_is_beit,
-                    )
-                elif is_swin:
-                    cam = generate_cam_swin(
-                        primary_model,
-                        x,
-                        target_index=target_idx,
-                        device=str(primary_device),
-                    )
-                elif cnn_target_layer is not None:
-                    _is_eff = "efficientnet" in str(primary_info.get("model_name", "")).lower()
-                    cam = generate_cam_cnn(
-                        primary_model,
-                        x,
-                        target_index=target_idx,
-                        target_layer=cnn_target_layer,
-                        device=str(primary_device),
-                        extra_smooth=_is_eff,
-                    )
+        for b_start in range(0, len(face_items), batch_size):
+            b_items = face_items[b_start : b_start + batch_size]
+            crops = [item[6] for item in b_items]
+            p_fakes, _, p_methods = _ensemble_predict_batch(detectors_info, crops, tx, mnames)
+
+            for rel_i, item in enumerate(b_items):
+                ci = item[0]
+                pf = float(p_fakes[rel_i])
+                is_fake = pf >= thr_used
+                if is_fake:
+                    if mnames and p_methods is not None:
+                        label = mnames[int(np.argmax(p_methods[rel_i]))]
+                    else:
+                        label = "Fake"
                 else:
-                    cam = None
+                    label = "Real"
+                pm_row = p_methods[rel_i] if p_methods is not None else None
+                infer_results[ci] = (pf, label, pm_row)
 
-                if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
-                    # scale CAM theo p_fake để frame "fake chắc" nóng hơn
-                    scale = float(pf)
-                    scale = max(0.05, min(1.0, scale))
-                    cam_scaled = cam * scale
+        # ── 4. Render từng frame theo thứ tự gốc ──
+        for ci, frm in enumerate(chunk_bgr):
+            orig_rgb = cv2.cvtColor(frm, cv2.COLOR_BGR2RGB)
 
-                    heat_crop = overlay_heatmap_on_bgr(crop_bgr, cam_scaled)
-                    heat_resized = cv2.resize(heat_crop, (x2 - x1, y2 - y1))
-                    out_bgr[y1:y2, x1:x2] = heat_resized
-            except Exception as e:
-                # Log lỗi Grad-CAM để debug; nếu ồn quá có thể đổi lại thành "pass"
-                print("[XAI] Grad-CAM error:", repr(e))
+            if ci in no_face_indices:
+                frame_tags.append("Real")
+                if use_imageio:
+                    writer.append_data(orig_rgb)
+                else:
+                    writer.write(frm)
+                continue
 
-        # GHI FRAME RA VIDEO DÙ CÓ CAM HAY KHÔNG
-        if use_imageio and writer is not None:
-            writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
-        elif (not use_imageio) and vout is not None:
-            vout.write(out_bgr)
+            pf, label, pm_row = infer_results.get(ci, (0.0, "Real", None))
+            is_fake = label != "Real"
+
+            if is_fake:
+                fake_frames += 1
+                m_count[label] = m_count.get(label, 0) + 1
+
+            frame_tags.append(label)
+
+            # Lấy lại thông tin detect để vẽ box và XAI
+            det = det_results[ci]
+            x1, y1, x2, y2, crop_bgr_item = det  # type: ignore
+
+            draw_box_with_label_np(
+                orig_rgb, [x1, y1, x2, y2], label,
+                color=(223, 64, 64) if is_fake else (64, 208, 120),
+                thickness=int(box_thickness),
+            )
+
+            # ── XAI ──
+            if enable_xai and primary_model is not None and crop_bgr_item is not None:
+                try:
+                    x_tensor = tx(crop_bgr_item).unsqueeze(0).to(primary_device).float()
+
+                    _was_half = next(primary_model.parameters()).dtype == torch.float16
+                    if _was_half:
+                        primary_model.float()
+                    try:
+                        if is_vit:
+                            _is_beit = "beit" in str(primary_info.get("model_name", "")).lower()
+                            cam = generate_cam_vit(
+                                primary_model, x_tensor, target_index=0,
+                                device=str(primary_device), smooth_output=_is_beit,
+                            )
+                        elif is_swin:
+                            cam = generate_cam_swin(
+                                primary_model, x_tensor, target_index=0,
+                                device=str(primary_device),
+                            )
+                        elif cnn_target_layer is not None:
+                            _is_eff = "efficientnet" in str(primary_info.get("model_name", "")).lower()
+                            cam = generate_cam_cnn(
+                                primary_model, x_tensor, target_index=0,
+                                target_layer=cnn_target_layer,
+                                device=str(primary_device),
+                                extra_smooth=_is_eff, smooth_samples=3,
+                            )
+                        else:
+                            cam = None
+                    finally:
+                        if _was_half:
+                            primary_model.half()
+
+                    if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
+                        scale = max(0.08, min(1.0, float(pf)))
+                        heat = overlay_heatmap_on_bgr(crop_bgr_item, cam * scale, alpha=0.65)
+                        heat = heat.astype(np.uint8) if heat.dtype != np.uint8 else heat
+                        heat_resized = cv2.resize(heat, (x2 - x1, y2 - y1), interpolation=cv2.INTER_LINEAR)
+                        out_bgr_tmp = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+                        out_bgr_tmp[y1:y2, x1:x2] = heat_resized
+                        orig_rgb = cv2.cvtColor(out_bgr_tmp, cv2.COLOR_BGR2RGB)
+                except Exception as e:
+                    print(f"[XAI] Error: {type(e).__name__} - {e}")
+
+            out_bgr = cv2.cvtColor(orig_rgb, cv2.COLOR_RGB2BGR)
+            if use_imageio:
+                writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
+            else:
+                writer.write(out_bgr)
 
     cap.release()
-    if use_imageio and writer is not None:
+    if use_imageio:
         writer.close()
-    elif vout is not None:
-        vout.release()
+    else:
+        writer.release()
 
     duration_sec = frames_total / fps if fps > 0 else 0.0
     verdict = render_verdict_text(frames_total, fake_frames)
 
-    # method distribution tables
-    method_rows_fake: List[Tuple[str, float]] = []
-    method_rows_total: List[Tuple[str, float]] = []
-
-    if len(mnames) > 0:
-        counts = np.array([m_count[m] for m in mnames], dtype=np.float64)
-
-        # A) % by fake frames (compat)
-        if fake_frames > 0 and counts.sum() > 0:
-            perc_fake = 100.0 * counts / counts.sum()
-            idx = np.argsort(-perc_fake)
-            method_rows_fake = [(mnames[int(i)], float(perc_fake[int(i)])) for i in idx]
-
-        # B) % by total frames (clearer)
-        if frames_total > 0:
-            perc_total = 100.0 * counts / float(frames_total)
-            idx2 = np.argsort(-perc_total)
-            method_rows_total = [(mnames[int(i)], float(perc_total[int(i)])) for i in idx2]
+    method_rows_total = []
+    if mnames and frames_total > 0:
+        counts = np.array([m_count.get(m, 0) for m in mnames], dtype=float)
+        perc = 100.0 * counts / frames_total
+        idx = np.argsort(-perc)
+        method_rows_total = [(mnames[i], float(perc[i])) for i in idx]
 
     stats = {
         "frames_total": int(frames_total),
@@ -440,11 +420,9 @@ def analyze_video(
         "fps": float(fps),
         "duration_sec": float(duration_sec),
         "threshold_used": float(thr_used),
-        "thr_override_ignored": bool(thr_override_ignored),
-        "detector_backend_used": backend_used_final or requested_backend,
+        "detector_backend_used": backend_used_final or detector_backend,
         "method_distribution": {k: int(v) for k, v in m_count.items()},
-        "frame_tags": frame_tags,  # NEW: per-frame timeline labels
+        "frame_tags": frame_tags,
     }
 
-    # Trả cả 2: FE sẽ ưu tiên *_total
-    return out_path, verdict, stats, method_rows_total or method_rows_fake
+    return out_path, verdict, stats, method_rows_total

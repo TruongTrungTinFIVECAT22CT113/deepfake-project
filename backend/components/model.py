@@ -12,58 +12,28 @@ IMAGENET_STD  = (0.229, 0.224, 0.225)
 
 
 def _infer_arch_family(model_name: str) -> str:
-    """
-    Suy ra 'family' kiến trúc từ tên backbone timm.
-    Ví dụ:
-      - Swin / SwinV2  -> 'swin'
-      - BEiT / ViT / DeiT / CaiT -> 'vit'
-      - MaxViT         -> 'maxvit'
-      - CoAtNet        -> 'coatnet'
-      - Còn lại        -> 'cnn'
-    """
     n = model_name.lower()
-    if "swin" in n:
-        return "swin"
-    if "maxvit" in n:
-        return "maxvit"
-    if "coatnet" in n:
-        return "coatnet"
-    if any(k in n for k in ["vit", "deit", "beit", "cait"]):
-        # BEiT cũng xem như ViT-style cho Grad-CAM token-based
-        return "vit"
+    if "swin" in n: return "swin"
+    if "maxvit" in n: return "maxvit"
+    if "coatnet" in n: return "coatnet"
+    if any(k in n for k in ["vit", "deit", "beit", "cait"]): return "vit"
     return "cnn"
 
 
 class MultiHeadViT(nn.Module):
-    def __init__(self, model_name: str, img_size: int,
-                 num_methods: int, num_face_classes: int, num_head_classes: int, num_full_classes: int,
+    def __init__(self, model_name: str, img_size: int, num_methods: int,
+                 num_face_classes: int, num_head_classes: int, num_full_classes: int,
                  drop_rate: float=0.0, drop_path_rate: float=0.0):
         super().__init__()
-
-        # Chuẩn bị kwargs cho timm.create_model
-        backbone_kwargs = dict(
-            pretrained=False,
-            num_classes=0,
-            drop_rate=drop_rate,
-            drop_path_rate=drop_path_rate,
-        )
-
-        # Chỉ những backbone kiểu ViT / Swin / BEiT... mới nhận img_size
+        backbone_kwargs = dict(pretrained=False, num_classes=0, drop_rate=drop_rate, drop_path_rate=drop_path_rate)
         if any(k in model_name.lower() for k in ["vit", "swin", "beit", "deit", "cait"]):
             backbone_kwargs["img_size"] = img_size
 
-        # ConvNeXt (vd: convnext_base.fb_in22k_ft_in1k_384) sẽ KHÔNG bị nhồi img_size nữa
-        self.backbone = timm.create_model(
-            model_name,
-            **backbone_kwargs,
-        )
+        self.backbone = timm.create_model(model_name, **backbone_kwargs)
         feat = self.backbone.num_features
 
-        def head(n):
-            return nn.Sequential(
-                nn.Dropout(p=drop_rate if drop_rate > 0 else 0.0),
-                nn.Linear(feat, n)
-            )
+        def head(n): 
+            return nn.Sequential(nn.Dropout(p=drop_rate), nn.Linear(feat, n))
 
         self.head_bin  = head(2)
         self.head_met  = head(num_methods)
@@ -78,7 +48,7 @@ class MultiHeadViT(nn.Module):
 
 def _infer_head_sizes_from_ckpt_state(ckpt_model_state: Dict[str, torch.Tensor]) -> Dict[str, int]:
     sizes = {"num_methods": 0, "num_face_classes": 1, "num_head_classes": 1, "num_full_classes": 1}
-    if "head_met.1.weight"  in ckpt_model_state: sizes["num_methods"]      = ckpt_model_state["head_met.1.weight"].shape[0]
+    if "head_met.1.weight" in ckpt_model_state: sizes["num_methods"] = ckpt_model_state["head_met.1.weight"].shape[0]
     if "head_face.1.weight" in ckpt_model_state: sizes["num_face_classes"] = ckpt_model_state["head_face.1.weight"].shape[0]
     if "head_head.1.weight" in ckpt_model_state: sizes["num_head_classes"] = ckpt_model_state["head_head.1.weight"].shape[0]
     if "head_full.1.weight" in ckpt_model_state: sizes["num_full_classes"] = ckpt_model_state["head_full.1.weight"].shape[0]
@@ -98,11 +68,7 @@ def build_transform(img_size: int):
 
 
 def discover_checkpoints() -> List[str]:
-    roots = [
-        os.path.join("deepfake_detector", "models"),
-        os.path.join("backend", "models"),
-        "models"
-    ]
+    roots = ["deepfake_detector/models", "backend/models", "models"]
     found = []
     for root in roots:
         if not os.path.isdir(root): continue
@@ -120,52 +86,40 @@ def load_single_detector(ckpt_path: str, device: torch.device):
     model_state = ckpt.get("model", {})
     ema_state = ckpt.get("ema", None)
 
-    # heads
     head_sizes = _infer_head_sizes_from_ckpt_state(model_state)
-    num_methods       = head_sizes["num_methods"] or len(meta.get("method_names", [])) or 7
-    num_face_classes  = head_sizes["num_face_classes"]
-    num_head_classes  = head_sizes["num_head_classes"]
-    num_full_classes  = head_sizes["num_full_classes"]
+    num_methods = head_sizes["num_methods"] or len(meta.get("method_names", [])) or 7
 
     model_name = meta.get("backbone_model") or meta.get("model_name") or "vit_base_patch16_384"
-    img_size   = int(meta.get("img_size", 384))
-    # sau khi load ckpt = torch.load(...)
-    ckpt_best_thr = ckpt.get("best_thr", None)
-    meta = ckpt.get("meta", {}) or {}
+    img_size = int(meta.get("img_size", 384))
 
-    best_thr = (
-        float(ckpt_best_thr)
-        if ckpt_best_thr is not None
-        else float(
-            meta.get("threshold",
-                 meta.get("best_thr",
-                     os.environ.get("DF_DEFAULT_THR", 0.818)
-                 )
-            )
-        )
-    )
+    model = MultiHeadViT(
+        model_name, img_size, num_methods,
+        head_sizes["num_face_classes"],
+        head_sizes["num_head_classes"],
+        head_sizes["num_full_classes"]
+    ).to(device)
 
-    model = MultiHeadViT(model_name, img_size, num_methods, num_face_classes, num_head_classes, num_full_classes).to(device)
+    model.eval()
+
+    # Load weights trước (FP32) — bắt buộc trước khi chuyển FP16
     dst = model.state_dict()
     if ema_state:
         dst.update(_filter_state_dict_by_shape(dst, ema_state))
     dst.update(_filter_state_dict_by_shape(dst, model_state))
     model.load_state_dict(dst, strict=False)
-    model.eval()
+
+    # FP16 SAU khi load weights xong
+    if device.type == "cuda":
+        try:
+            model = model.half()
+        except Exception as e:
+            print(f"[WARN] FP16 failed: {e}")
+
+    arch_family = _infer_arch_family(model_name)
+    arch_type = "swin" if arch_family == "swin" else "vit" if arch_family == "vit" else "cnn"
 
     tfm = build_transform(img_size)
     method_names = meta.get("method_names", [f"method_{i}" for i in range(num_methods)])
-
-    # ---- Nhận diện kiến trúc cho Grad-CAM / XAI ----
-    arch_family = _infer_arch_family(model_name)
-    # arch_type = nhóm cho Grad-CAM (vit / swin / cnn)
-    if arch_family == "swin":
-        arch_type = "swin"
-    elif arch_family == "vit":
-        arch_type = "vit"
-    else:
-        # MaxViT / CoAtNet / ConvNeXt / EffNet / ResNet... đều đi theo nhánh CNN-based
-        arch_type = "cnn"
 
     return {
         "model": model,
@@ -173,19 +127,16 @@ def load_single_detector(ckpt_path: str, device: torch.device):
         "device": device,
         "method_names": method_names,
         "img_size": img_size,
-        "best_thr": best_thr,
+        "best_thr": float(ckpt.get("best_thr", meta.get("threshold", meta.get("best_thr", 0.818)))),
         "ckpt_path": ckpt_path,
         "model_name": model_name,
-        "arch_family": arch_family,
+        "arch_family": _infer_arch_family(model_name),
         "arch_type": arch_type,
     }
 
 
-def load_multiple_detectors(ckpt_paths: List[str], device_name: Optional[str]=None):
+def load_multiple_detectors(ckpt_paths: List[str], device_name: Optional[str] = None):
     if device_name is None:
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
-    infos = []
-    for p in ckpt_paths:
-        infos.append(load_single_detector(p, device))
-    return infos
+    return [load_single_detector(p, device) for p in ckpt_paths]
