@@ -16,7 +16,7 @@ from torch import nn
 # ═══════════════════════════════════════════════════════════════
 
 def _normalize_cam(cam: torch.Tensor) -> np.ndarray:
-    cam = cam.detach()
+    cam = cam.detach().float()   # ép FP32 trước khi ra numpy — cv2 không hỗ trợ FP16
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-6)
     return cam.cpu().numpy()
@@ -165,9 +165,11 @@ def generate_cam_cnn(
 
     inp_std = float(input_tensor.std().item()) * smooth_noise
 
-    # EfficientNet dùng GradCAM thường (không GradCAM++) vì compound scaling
-    # làm GradCAM++ cho ra heatmap flat. Các CNN khác dùng GradCAM++.
-    single_fn = _gradcam_original_single if extra_smooth else _gradcam_plus_plus_single
+    # EfficientNet blocks[-3]: dùng GradCAM++ vì layer này rộng hơn blocks[-2]
+    # GradCAM++ cho nhiều local maxima → dùng median thay mean để suppress outlier
+    # ConvNeXt/ResNet: GradCAM++ + mean như cũ
+    use_pp = True   # cả EfficientNet và CNN đều dùng GradCAM++ với blocks[-3]
+    single_fn = _gradcam_plus_plus_single
 
     cams = []
     for _ in range(smooth_samples):
@@ -175,24 +177,33 @@ def generate_cam_cnn(
         noisy = (input_tensor + noise).to(device)
         cams.append(single_fn(model, noisy, target_layer, target_index, device))
 
-    cam_avg = np.mean(np.stack(cams, axis=0), axis=0)
+    cams_stack = np.stack(cams, axis=0)   # [N, H, W]
+
+    if extra_smooth:
+        # EfficientNet: dùng median để loại outlier peak, ổn định hơn mean
+        cam_avg = np.median(cams_stack, axis=0)
+    else:
+        cam_avg = np.mean(cams_stack, axis=0)
+
     cam_avg = cam_avg - cam_avg.min()
     cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
-    # EfficientNet: oval mask tập trung vào vùng mặt
-    # cy=0.40 vì crop EfficientNet ít cắt trán hơn ViT
+    # ── EfficientNet: blur nhẹ SAU median để nối vùng gần nhau
+    # blur trên CAM đã aggregate (không phải feature map nhỏ) → không flat
     if extra_smooth:
         H_c, W_c = cam_avg.shape
-        cy = int(H_c * 0.40)
-        cx = int(W_c * 0.50)
-        ry = int(H_c * 0.42)
-        rx = int(W_c * 0.40)
-        Y, X = np.ogrid[:H_c, :W_c]
-        dist = ((X - cx) / max(rx, 1)) ** 2 + ((Y - cy) / max(ry, 1)) ** 2
-        oval_mask = np.clip(1.5 - dist, 0.0, 1.0).astype(np.float32)
-        oval_mask = cv2.GaussianBlur(oval_mask, (0, 0), sigmaX=20, sigmaY=20)
-        cam_avg = cam_avg * oval_mask
+        # sigma nhỏ: chỉ nối các peak gần nhau, không làm flat toàn bộ map
+        _sigma = max(1.0, W_c * 0.02)
+        cam_avg = cv2.GaussianBlur(cam_avg, (0, 0), sigmaX=_sigma, sigmaY=_sigma)
         cam_avg = cam_avg - cam_avg.min()
+        cam_avg = cam_avg / (cam_avg.max() + 1e-6)
+        # power=3.0: suppress mạnh vùng thấp, chỉ giữ peak thực sự nóng
+        cam_avg = np.power(cam_avg, 3.0)
+        cam_avg = cam_avg / (cam_avg.max() + 1e-6)
+
+    # ── ConvNeXt / ResNet: power vừa phải
+    else:
+        cam_avg = np.power(cam_avg, 2.2)
         cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
     return cam_avg

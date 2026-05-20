@@ -25,11 +25,11 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 ENSEMBLE_THR_DEFAULT = 0.58
 
-BASE_BATCH_SIZE = 48
-XAI_BATCH_SIZE  = 24
+BASE_BATCH_SIZE = 64
+XAI_BATCH_SIZE  = 48
 
 # Số frame đọc vào RAM trước khi detect + infer cùng lúc.
-# Tăng nếu GPU VRAM > 8 GB, giảm nếu VRAM thấp.
+# Tăng nếu GPU VRAM > 8 GB, giảm nếu RAM thấp.
 READ_AHEAD = 128
 
 
@@ -72,25 +72,55 @@ def _ensemble_predict_batch(detectors_info, crops_bgr, tx, method_names):
 
 
 def _guess_cnn_target_layer(backbone: nn.Module):
-    if "convnext" in backbone.__class__.__name__.lower():
+    """
+    Đoán target layer cho GradCAM CNN — giữ nguyên logic bản gốc:
+      - ConvNeXt: stages[-1][-1]  (check hasattr trước, không check class name)
+      - EfficientNet: blocks[-2]  (không phải [-1], để map lan rộng hơn)
+      - ResNet-like: layer4 / layers4 / block4 / stage4
+      - Fallback: Conv2d cuối cùng
+    """
+    # 1) ConvNeXt: check hasattr("stages") — không dùng class name vì timm đặt tên khác nhau
+    if hasattr(backbone, "stages"):
         try:
-            return backbone.stages[-1][-1]
+            stages = backbone.stages
+            if hasattr(stages, "__len__") and len(stages) > 0:
+                last_stage = stages[-1]
+                if hasattr(last_stage, "__len__") and len(last_stage) > 0:
+                    return last_stage[-1]
+                return last_stage
         except Exception:
             pass
+
+    # 2) EfficientNet / RegNet: có .blocks
     if hasattr(backbone, "blocks"):
         try:
-            return backbone.blocks[-1]
+            blocks = backbone.blocks
+            if hasattr(blocks, "__len__") and len(blocks) > 0:
+                cls_name = backbone.__class__.__name__.lower()
+                # EfficientNet dùng blocks[-2]: discriminative nhất, oval mask lo phần còn lại
+                if "efficientnet" in cls_name and len(blocks) >= 2:
+                    idx = len(blocks) - 2
+                else:
+                    idx = len(blocks) - 1
+                last_block = blocks[idx]
+                if hasattr(last_block, "__len__") and len(last_block) > 0:
+                    return last_block[-1]
+                return last_block
         except Exception:
             pass
-    for attr in ["layer4", "layers4", "stage4", "block4"]:
+
+    # 3) ResNet-like
+    for attr in ["layer4", "layers4", "block4", "stage4"]:
         if hasattr(backbone, attr):
             try:
                 layer = getattr(backbone, attr)
                 if hasattr(layer, "__len__") and len(layer) > 0:
-                    layer = layer[-1]
+                    return layer[-1]
                 return layer
             except Exception:
                 pass
+
+    # 4) Fallback: Conv2d cuối cùng
     last_conv = None
     for m in backbone.modules():
         if isinstance(m, nn.Conv2d):
@@ -372,7 +402,7 @@ def analyze_video(
                                 primary_model, x_tensor, target_index=0,
                                 target_layer=cnn_target_layer,
                                 device=str(primary_device),
-                                extra_smooth=_is_eff, smooth_samples=3,
+                                extra_smooth=_is_eff, smooth_samples=5,
                             )
                         else:
                             cam = None

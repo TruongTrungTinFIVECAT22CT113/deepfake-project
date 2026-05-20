@@ -429,11 +429,11 @@ export default function ResultPanel(props: {
       <div className="actions">
         <a className="btn small" href={r.video_url} download>Tải video đã phân tích</a>
         <button className="btn small btn-ghost" onClick={downloadReport}>Tải báo cáo thống kê</button>
-        {props.previewUrl && (
+        {/* {props.previewUrl && (
           <button className="btn small btn-ghost" onClick={() => setShowCompare(!showCompare)}>
             {showCompare ? "Ẩn so sánh" : "So sánh Video đã tải lên / đã phân tích"}
           </button>
-        )}
+        )} */}
       </div>
     </div>
   );
