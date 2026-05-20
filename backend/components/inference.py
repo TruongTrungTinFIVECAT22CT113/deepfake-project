@@ -19,7 +19,10 @@ from .face_detection import (
     _square_crop_from_bbox,
     _retina_det_thr,
 )
-from .xai_cam import generate_cam_vit, generate_cam_cnn, generate_cam_swin, overlay_heatmap_on_bgr
+from .xai_cam import (
+    generate_cam_vit, generate_cam_cnn, generate_cam_swin, overlay_heatmap_on_bgr,
+    CnnHookContext, generate_cam_cnn_with_ctx,
+)
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -48,18 +51,19 @@ def _ensemble_predict_batch(detectors_info, crops_bgr, tx, method_names):
         return [], [], None
 
     device = detectors_info[0]["device"]
-    batch_tensors = torch.stack([tx(crop) for crop in crops_bgr]).to(device)
-
-    # Tự động ép FP16 nếu model đang ở FP16
-    first_param = next(detectors_info[0]["model"].parameters())
-    if batch_tensors.dtype == torch.float32 and first_param.dtype == torch.float16:
-        batch_tensors = batch_tensors.half()
+    # batch_tensors ở FP32 — mỗi model tự cast sang dtype của nó trong vòng lặp bên dưới.
+    # KHÔNG cast 1 lần theo model[0]: khi XAI đang giữ primary_model ở FP32 trong khi
+    # các model khác vẫn FP16, cast chung sẽ gây mismatch dtype → RuntimeError.
+    batch_tensors = torch.stack([tx(crop) for crop in crops_bgr]).to(device)  # FP32
 
     p_fake_list = []
     pm_list = []
 
     for info in detectors_info:
-        lb, lm, *_ = info["model"](batch_tensors)
+        first_param = next(info["model"].parameters())
+        # Cast tensor sang đúng dtype của từng model — an toàn khi XAI thay đổi dtype 1 model
+        t = batch_tensors.to(dtype=first_param.dtype) if batch_tensors.dtype != first_param.dtype else batch_tensors
+        lb, lm, *_ = info["model"](t)
         pbin = torch.softmax(lb, dim=1)
         p_fake_list.append(pbin[:, 0])
         if method_names:
@@ -260,6 +264,8 @@ def analyze_video(
     primary_info = primary_model = primary_device = None
     is_vit = is_swin = False
     cnn_target_layer = None
+    _cnn_hook_ctx: Optional[CnnHookContext] = None   # hook cache cho CNN
+    _xai_model_was_half = False                       # để restore FP16 sau khi xong
 
     if enable_xai and detectors_info:
         if xai_primary_index is not None and 0 <= xai_primary_index < len(detectors_info):
@@ -283,6 +289,22 @@ def analyze_video(
             cnn_target_layer = _guess_cnn_target_layer(
                 getattr(primary_model, "backbone", primary_model)
             )
+
+        # ── Tối ưu tốc độ XAI ──────────────────────────────────────────────
+        # 1) Giữ model ở FP32 suốt cả video thay vì flip FP32↔FP16 mỗi frame.
+        #    primary_model.float() / .half() mỗi frame tốn ~8-15ms/frame vì
+        #    phải copy toàn bộ weight tensor trên GPU.
+        # 2) CNN: register hook 1 lần → 0 overhead per-frame.
+        #    ViT/Swin: hook đơn giản hơn, overhead nhỏ hơn, giữ nguyên per-call.
+        if primary_model is not None:
+            _xai_model_was_half = (
+                next(primary_model.parameters()).dtype == torch.float16
+            )
+            if _xai_model_was_half:
+                primary_model.float()   # FP32 cho cả video — restore sau khi xong
+
+        if cnn_target_layer is not None:
+            _cnn_hook_ctx = CnnHookContext(cnn_target_layer)
 
     device_type_str = str(detectors_info[0]["device"].type)
 
@@ -382,39 +404,34 @@ def analyze_video(
                 thickness=int(box_thickness),
             )
 
-            # ── XAI ──
-            if enable_xai and primary_model is not None and crop_bgr_item is not None:
+            # ── XAI — chỉ render trên fake frame ──
+            # Real frame không cần heatmap → tiết kiệm ~(1 - fake_ratio) × XAI time
+            if enable_xai and is_fake and primary_model is not None and crop_bgr_item is not None:
                 try:
-                    x_tensor = tx(crop_bgr_item).unsqueeze(0).to(primary_device).float()
+                    x_tensor = tx(crop_bgr_item).unsqueeze(0)
+                    # Model đã ở FP32 suốt video (convert 1 lần ở setup) — không flip ở đây
 
-                    _was_half = next(primary_model.parameters()).dtype == torch.float16
-                    if _was_half:
-                        primary_model.float()
-                    try:
-                        if is_vit:
-                            _is_beit = "beit" in str(primary_info.get("model_name", "")).lower()
-                            cam = generate_cam_vit(
-                                primary_model, x_tensor, target_index=0,
-                                device=str(primary_device), smooth_output=_is_beit,
-                            )
-                        elif is_swin:
-                            cam = generate_cam_swin(
-                                primary_model, x_tensor, target_index=0,
-                                device=str(primary_device),
-                            )
-                        elif cnn_target_layer is not None:
-                            _is_eff = "efficientnet" in str(primary_info.get("model_name", "")).lower()
-                            cam = generate_cam_cnn(
-                                primary_model, x_tensor, target_index=0,
-                                target_layer=cnn_target_layer,
-                                device=str(primary_device),
-                                extra_smooth=_is_eff, smooth_samples=5,
-                            )
-                        else:
-                            cam = None
-                    finally:
-                        if _was_half:
-                            primary_model.half()
+                    if is_vit:
+                        _is_beit = "beit" in str(primary_info.get("model_name", "")).lower()
+                        cam = generate_cam_vit(
+                            primary_model, x_tensor, target_index=0,
+                            device=str(primary_device), smooth_output=_is_beit,
+                        )
+                    elif is_swin:
+                        cam = generate_cam_swin(
+                            primary_model, x_tensor, target_index=0,
+                            device=str(primary_device),
+                        )
+                    elif _cnn_hook_ctx is not None:
+                        # Fast path: hook đã cache, 1 pass, không SmoothGrad
+                        _is_eff = "efficientnet" in str(primary_info.get("model_name", "")).lower()
+                        cam = generate_cam_cnn_with_ctx(
+                            primary_model, x_tensor, _cnn_hook_ctx,
+                            target_index=0, device=str(primary_device),
+                            extra_smooth=_is_eff,
+                        )
+                    else:
+                        cam = None
 
                     if cam is not None and (x2 - x1) > 0 and (y2 - y1) > 0:
                         scale = max(0.08, min(1.0, float(pf)))
@@ -438,6 +455,12 @@ def analyze_video(
         writer.close()
     else:
         writer.release()
+
+    # ── Cleanup XAI: remove hook cache, restore model dtype ──────────────────
+    if _cnn_hook_ctx is not None:
+        _cnn_hook_ctx.remove()
+    if _xai_model_was_half and primary_model is not None:
+        primary_model.half()   # restore FP16 để inference batch tiếp theo không bị chậm
 
     duration_sec = frames_total / fps if fps > 0 else 0.0
     processing_time_sec = time.perf_counter() - t0

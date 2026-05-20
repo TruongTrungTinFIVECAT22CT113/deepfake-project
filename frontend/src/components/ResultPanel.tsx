@@ -18,6 +18,7 @@ type NewFields = {
   analyzed_start_sec?: number | null;
   analyzed_end_sec?: number | null;
   explanation_basic?: ExplanationBasic;
+  processing_time_sec?: number | null;
 };
 
 type ExplanationBasic = {
@@ -57,20 +58,28 @@ function formatTimeLabel(sec: number, isEnd = false) {
 }
 function chooseTickStep(d: number) { if (d <= 15) return 1; if (d <= 60) return 5; if (d <= 180) return 10; return 30; }
 
-function formatAnalyzedRange(dur: number | undefined, aStart?: number | null, aEnd?: number | null) {
+function formatProcessingTime(sec: number): string {
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const m = Math.floor(sec / 60);
+  const s = (sec % 60).toFixed(0).padStart(2, "0");
+  return `${m}m${s}s`;
+}
+
+function formatAnalyzedRange(dur: number | undefined, aStart?: number | null, aEnd?: number | null, procSec?: number | null) {
   if (!dur || dur <= 0) return null;
-  if (aStart == null && aEnd == null) return "Đã phân tích: toàn bộ video";
+  const timeSuffix = procSec != null && procSec > 0 ? ` (hết ${formatProcessingTime(procSec)})` : "";
+  if (aStart == null && aEnd == null) return `Đã phân tích: toàn bộ video${timeSuffix}`;
   const start = aStart == null ? 0 : Math.max(0, aStart);
   const end = aEnd == null ? dur : Math.max(0, Math.min(dur, aEnd));
-  if (end <= start) return "Đã phân tích: toàn bộ video";
+  if (end <= start) return `Đã phân tích: toàn bộ video${timeSuffix}`;
   const fmt = (s: number) => s < 60 ? `${s.toFixed(1)}s` : `${Math.floor(s / 60)}:${String((s % 60).toFixed(1)).padStart(4, "0")}`;
-  return `Đã phân tích: ${fmt(start)} → ${fmt(end)}`;
+  return `Đã phân tích: ${fmt(start)} → ${fmt(end)}${timeSuffix}`;
 }
 
 function buildStatsReport(r: any): string {
   const lines: string[] = [];
   lines.push("═══════════════════════════════════════");
-  lines.push("  BÁO CÁO PHÂN TÍCH DEEPFAKE");
+  lines.push("  BÁO CÁO PHÂN TÍCH");
   lines.push("  Ngày: " + new Date().toLocaleString("vi-VN"));
   lines.push("═══════════════════════════════════════");
   lines.push("");
@@ -78,26 +87,26 @@ function buildStatsReport(r: any): string {
   if (r.verdict) lines.push(`Kết luận: ${r.verdict}`);
   if (r.frames_total != null) {
     const real = r.frames_total - (r.fake_frames ?? 0);
-    lines.push(`Tổng khung hình: ${r.frames_total}`);
-    lines.push(`Khung hình giả:  ${r.fake_frames ?? 0} (${((r.fake_ratio ?? 0) * 100).toFixed(1)}%)`);
-    lines.push(`Khung hình thật: ${real} (${((1 - (r.fake_ratio ?? 0)) * 100).toFixed(1)}%)`);
+    lines.push(`Tổng khung hình có khuôn mặt: ${r.frames_total}`);
+    lines.push(`Khung hình có Deepfake:  ${r.fake_frames ?? 0} (${((r.fake_ratio ?? 0) * 100).toFixed(1)}%)`);
+    lines.push(`Khung hình có khuôn mặt thật: ${real} (${((1 - (r.fake_ratio ?? 0)) * 100).toFixed(1)}%)`);
   }
   if (r.duration_sec) lines.push(`Thời lượng video: ${r.duration_sec.toFixed(1)}s`);
   if (r.fps) lines.push(`FPS: ${r.fps}`);
 
-  const aRange = formatAnalyzedRange(r.duration_sec, r.analyzed_start_sec, r.analyzed_end_sec);
+  const aRange = formatAnalyzedRange(r.duration_sec, r.analyzed_start_sec, r.analyzed_end_sec, r.processing_time_sec);
   if (aRange) lines.push(aRange);
 
   const rows = r.method_rows_total?.length ? r.method_rows_total : r.method_rows_fake?.length ? r.method_rows_fake : r.method_rows || [];
   if (rows.length) {
     lines.push("");
-    lines.push("── Phân bố phương pháp ──");
+    lines.push("── Các loại kỹ thuật phát hiện được ──");
     for (const [m, p] of rows) lines.push(`  ${m}: ${typeof p === "number" ? p.toFixed(1) : p}%`);
   }
 
   if (r.explanation_basic) {
     lines.push("");
-    lines.push(`── Giải thích: ${r.explanation_basic.method} ──`);
+    lines.push(`── Giải thích về: ${r.explanation_basic.method} ──`);
     lines.push(r.explanation_basic.summary);
     if (r.explanation_basic.artifacts?.length) {
       for (const [name, desc] of r.explanation_basic.artifacts) lines.push(`  • ${name}: ${desc}`);
@@ -169,12 +178,91 @@ export default function ResultPanel(props: {
     URL.revokeObjectURL(url);
   }
 
+  // ── Fake progress khi loading ────────────────────────────────────────────
+  // Backend không có SSE/WebSocket → không có progress thực tế.
+  // Dùng easing asymptotic: progress = 99 * (1 - e^(-t/τ))
+  //   - Không bao giờ đứng cứng, luôn tăng (ngày càng chậm hơn)
+  //   - τ (tau) = ước tính thời gian xử lý = videoDuration / 2 (baseline 2× realtime)
+  //   - Ở t=τ: ~63%, t=2τ: ~86%, t=3τ: ~95%, không bao giờ đạt 100% cho đến khi xong thật
+  const [progress, setProgress] = useState(0);
+  const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const progressStartRef = useRef<number>(0);
+  const progressTauRef = useRef<number>(30000);  // ms
+
+  useEffect(() => {
+    if (props.loading) {
+      setProgress(0);
+      progressStartRef.current = Date.now();
+      // τ = videoDuration/2 giây, tối thiểu 8s, tối đa 300s
+      const videoDur = props.previewDuration ?? 60;
+      progressTauRef.current = Math.min(300_000, Math.max(8_000, (videoDur / 2) * 1000));
+
+      progressRef.current = setInterval(() => {
+        const elapsed = Date.now() - progressStartRef.current;
+        const tau = progressTauRef.current;
+        // Asymptotic: 99 * (1 - e^(-t/τ)), tối đa 99%
+        const pct = 99 * (1 - Math.exp(-elapsed / tau));
+        setProgress(Math.min(99, pct));
+      }, 250);
+    } else {
+      if (progressRef.current) {
+        clearInterval(progressRef.current);
+        progressRef.current = null;
+      }
+      if (progress > 0) {
+        setProgress(100);
+        const t = setTimeout(() => setProgress(0), 700);
+        return () => clearTimeout(t);
+      }
+    }
+    return () => {
+      if (progressRef.current) { clearInterval(progressRef.current); progressRef.current = null; }
+    };
+  }, [props.loading]);
+
   if (props.loading) {
+    const pct = Math.round(progress);
     return (
-      <div className="stack">
-        <div className="skeleton box" />
-        <div className="skeleton line" style={{ width: "60%" }} />
-        <div className="skeleton line" style={{ width: "40%" }} />
+      <div className="stack" style={{ padding: "0.5rem 0" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.4rem" }}>
+          <span style={{ fontSize: "0.9rem", fontWeight: 500, color: "var(--text)" }}>Đang phân tích video…</span>
+          <span style={{ fontSize: "0.85rem", color: "var(--text-secondary)", fontVariantNumeric: "tabular-nums" }}>
+            {pct}%
+          </span>
+        </div>
+
+        {/* Track */}
+        <div style={{
+          height: "0.55rem", borderRadius: "1rem", background: "var(--surface-3)",
+          border: "1px solid var(--border-subtle)", overflow: "hidden",
+        }}>
+          {/* Fill với transition mượt */}
+          <div style={{
+            height: "100%", borderRadius: "1rem",
+            width: `${pct}%`,
+            background: pct < 95
+              ? "linear-gradient(90deg, var(--accent, #6366f1), #a78bfa)"
+              : "linear-gradient(90deg, #22c55e, #4ade80)",
+            transition: "width 0.18s ease-out, background 0.4s",
+          }} />
+        </div>
+
+        <div style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "0.25rem" }}>
+          {pct < 25 && "Đang nhận diện khuôn mặt…"}
+          {pct >= 25 && pct < 55 && "Đang phân tích từng khung hình…"}
+          {pct >= 55 && pct < 80 && "Đang tổng hợp kết quả…"}
+          {pct >= 80 && pct < 99 && "Đang hoàn thiện, vui lòng chờ…"}
+          {pct >= 99 && "Chuẩn bị trả về kết quả…"}
+        </div>
+
+        {/* Preview video mờ trong khi chờ */}
+        {props.previewUrl && (
+          <div style={{ opacity: 0.45, pointerEvents: "none", marginTop: "0.5rem" }}>
+            <div className={`video-wrap ${videoClass}`} style={{ aspectRatio }}>
+              <video src={props.previewUrl} className="media" muted onLoadedMetadata={handleVideoMeta} />
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -263,7 +351,7 @@ export default function ResultPanel(props: {
   const totalFrames = typeof r.frames_total === "number" ? r.frames_total : tags?.length || 0;
   const cmap = buildColorMap(tags);
   const duration = typeof r.duration_sec === "number" && r.duration_sec > 0 ? r.duration_sec : totalFrames > 0 ? totalFrames / (typeof r.fps === "number" && r.fps > 0 ? r.fps : 25) : 0;
-  const analyzedLabel = formatAnalyzedRange(duration, r.analyzed_start_sec ?? null, r.analyzed_end_sec ?? null);
+  const analyzedLabel = formatAnalyzedRange(duration, r.analyzed_start_sec ?? null, r.analyzed_end_sec ?? null, r.processing_time_sec ?? null);
 
   return (
     <div className="stack">

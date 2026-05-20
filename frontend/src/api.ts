@@ -45,6 +45,7 @@ export type AnalyzeResult = {
   analyzed_start_sec: number | null;
   analyzed_end_sec: number | null;
   explanation_basic: ExplanationBasic | null;
+  processing_time_sec?: number | null;   // thời gian backend xử lý (giây)
 };
 
 export type AnalyzeOptions = {

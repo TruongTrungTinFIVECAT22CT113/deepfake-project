@@ -50,9 +50,86 @@ def save_cam_image(frame_bgr: np.ndarray, cam_2d: np.ndarray, out_dir: Optional[
 
 
 # ═══════════════════════════════════════════════════════════════
-# CNN — GradCAM++ + SmoothGrad
+# CNN — GradCAM++ với cached hook (tối ưu tốc độ)
 # ═══════════════════════════════════════════════════════════════
 
+class CnnHookContext:
+    """
+    Register forward+backward hook lên target_layer MỘT LẦN duy nhất cho cả video.
+    Dùng như context manager hoặc gọi .remove() thủ công khi xong.
+
+    Tại sao cache hook thay vì register/remove mỗi frame:
+    - register_forward_hook / register_backward_hook đều acquire lock nội bộ
+      của nn.Module để gắn handle vào _forward_hooks / _backward_hooks.
+    - Mỗi frame gọi 2×register + 2×remove = 4 lần acquire/release lock → overhead
+      thuần Python cộng dồn đáng kể ở 25–30 fps.
+    - Cache 1 lần, giữ suốt video → 0 overhead per-frame.
+    """
+    def __init__(self, target_layer: nn.Module):
+        self.features: dict = {}
+        self.gradients: dict = {}
+
+        def fwd(module, inp, out):
+            self.features["value"] = out.detach()
+
+        def bwd(module, gin, gout):
+            self.gradients["value"] = gout[0].detach()
+
+        self._h1 = target_layer.register_forward_hook(fwd)
+        self._h2 = target_layer.register_backward_hook(bwd)
+
+    def remove(self):
+        self._h1.remove()
+        self._h2.remove()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.remove()
+
+
+def _gradcam_pp_with_ctx(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    ctx: CnnHookContext,
+    target_index: int,
+    device: str,
+) -> np.ndarray:
+    """
+    GradCAM++ dùng hook đã được register sẵn từ CnnHookContext.
+    Không register/remove hook → zero per-frame overhead.
+    Chạy native dtype của model (FP16/FP32).
+    """
+    first_param = next(model.parameters())
+    x = input_tensor.to(device=device, dtype=first_param.dtype)
+
+    with torch.enable_grad():
+        # Không .clone() thừa — detach rồi requires_grad trực tiếp
+        inp = x.detach().requires_grad_(True)
+        out = model(inp)
+        logits_bin = out[0] if isinstance(out, (list, tuple)) else out
+        score = logits_bin[0, target_index]
+        model.zero_grad()
+        score.backward()
+
+    with torch.no_grad():
+        feat = ctx.features["value"].float()    # [1, C, h, w]
+        grad = ctx.gradients["value"].float()   # [1, C, h, w]
+
+        grad_2 = grad ** 2
+        grad_3 = grad ** 3
+        # mean (không phải sum) theo paper GradCAM++ — tránh scale blow-up
+        sum_act = feat.mean(dim=(2, 3), keepdim=True)
+        denom = 2.0 * grad_2 + sum_act * grad_3 + 1e-7
+        alpha = grad_2 / denom
+        weights = (alpha * torch.relu(grad)).sum(dim=(2, 3), keepdim=True)
+        cam = torch.relu((weights * feat).sum(dim=1).squeeze(0))
+
+    return _normalize_cam(cam)
+
+
+# Giữ lại hàm cũ để không break code nào đang gọi trực tiếp
 def _gradcam_original_single(
     model: nn.Module,
     input_tensor: torch.Tensor,
@@ -60,9 +137,9 @@ def _gradcam_original_single(
     target_index: int,
     device: str,
 ) -> np.ndarray:
-    """GradCAM thường — hoạt động tốt hơn GradCAM++ với EfficientNet."""
-    features = {}
-    gradients = {}
+    """GradCAM thường — fallback khi không có CnnHookContext."""
+    features: dict = {}
+    gradients: dict = {}
 
     def fwd_hook(module, inp, out):
         features["value"] = out.detach()
@@ -77,7 +154,7 @@ def _gradcam_original_single(
     x = input_tensor.to(device=device, dtype=first_param.dtype)
 
     with torch.enable_grad():
-        inp = x.clone().requires_grad_(True)
+        inp = x.detach().requires_grad_(True)
         out = model(inp)
         logits_bin = out[0] if isinstance(out, (list, tuple)) else out
         score = logits_bin[0, target_index]
@@ -103,12 +180,9 @@ def _gradcam_plus_plus_single(
     target_index: int,
     device: str,
 ) -> np.ndarray:
-    """
-    GradCAM++ cho 1 lần forward — serial, 1 sample.
-    Chạy native dtype của model (FP16/FP32), bọc tính CAM trong no_grad.
-    """
-    features = {}
-    gradients = {}
+    """GradCAM++ fallback (register hook mỗi lần) — dùng khi không có CnnHookContext."""
+    features: dict = {}
+    gradients: dict = {}
 
     def fwd_hook(module, inp, out):
         features["value"] = out.detach()
@@ -119,12 +193,11 @@ def _gradcam_plus_plus_single(
     h1 = target_layer.register_forward_hook(fwd_hook)
     h2 = target_layer.register_backward_hook(bwd_hook)
 
-    # Cast input theo dtype model — không ép FP32 mỗi lần
     first_param = next(model.parameters())
     x = input_tensor.to(device=device, dtype=first_param.dtype)
 
     with torch.enable_grad():
-        inp = x.clone().requires_grad_(True)
+        inp = x.detach().requires_grad_(True)
         out = model(inp)
         logits_bin = out[0] if isinstance(out, (list, tuple)) else out
         score = logits_bin[0, target_index]
@@ -135,71 +208,24 @@ def _gradcam_plus_plus_single(
     h2.remove()
 
     with torch.no_grad():
-        feat = features["value"].float()    # [1, C, h, w]
-        grad = gradients["value"].float()   # [1, C, h, w]
-
+        feat = features["value"].float()
+        grad = gradients["value"].float()
         grad_2 = grad ** 2
         grad_3 = grad ** 3
-        # mean (không phải sum) theo paper GradCAM++ — tránh scale blow-up
         sum_act = feat.mean(dim=(2, 3), keepdim=True)
         denom = 2.0 * grad_2 + sum_act * grad_3 + 1e-7
         alpha = grad_2 / denom
         weights = (alpha * torch.relu(grad)).sum(dim=(2, 3), keepdim=True)
-
         cam = torch.relu((weights * feat).sum(dim=1).squeeze(0))
 
     return _normalize_cam(cam)
 
 
-def generate_cam_cnn(
-    model: nn.Module,
-    input_tensor: torch.Tensor,
-    target_index: int = 1,
-    target_layer: Optional[nn.Module] = None,
-    device: str = "cuda",
-    smooth_samples: int = 3,
-    smooth_noise: float = 0.015,
-    extra_smooth: bool = False,
-) -> np.ndarray:
+def _apply_cnn_postprocess(cam_avg: np.ndarray, extra_smooth: bool) -> np.ndarray:
     """
-    GradCAM++ + SmoothGrad cho CNN (ConvNeXt, EfficientNet, ResNetRS...).
-
-    Giữ nguyên serial loop — KHÔNG batch nhiều samples vào 1 forward:
-    EfficientNet/ResNet dùng BatchNorm, batch N samples sẽ làm BN tính
-    statistics cross-sample → gradient bị pha trộn chéo → heatmap nhiễu.
-    ViT/Swin không bị nhưng chúng đã có hàm riêng.
-
-    Tối ưu: chạy native dtype của model (FP16 trên CUDA), bọc tính CAM
-    trong no_grad để tránh requires_grad lỗi khi .numpy().
+    Post-process chung cho CNN CAM: normalize → smooth → oval mask.
+    Tách ra hàm riêng để tái dùng, tránh lặp code.
     """
-    model.eval()
-    if target_layer is None:
-        raise ValueError("Bạn phải truyền target_layer vào generate_cam_cnn")
-
-    # Giữ nguyên dtype gốc của model (FP16 nếu CUDA) — không cast mỗi frame
-    first_param = next(model.parameters())
-    model_dtype = first_param.dtype
-    x0 = input_tensor.to(device=device, dtype=model_dtype)
-
-    inp_std = float(x0.float().std().item()) * smooth_noise
-    single_fn = _gradcam_plus_plus_single
-
-    cams = []
-    for i in range(smooth_samples):
-        if i == 0 or inp_std <= 0:
-            noisy = x0
-        else:
-            noise = torch.randn_like(x0) * inp_std
-            noisy = x0 + noise
-        cams.append(single_fn(model, noisy, target_layer, target_index, device))
-
-    cams_stack = np.stack(cams, axis=0)   # [N, h, w]
-
-    if extra_smooth:
-        cam_avg = np.median(cams_stack, axis=0)
-    else:
-        cam_avg = np.mean(cams_stack, axis=0)
-
     cam_avg = cam_avg - cam_avg.min()
     cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
@@ -215,10 +241,7 @@ def generate_cam_cnn(
         cam_avg = np.power(cam_avg, 2.2)
         cam_avg = cam_avg / (cam_avg.max() + 1e-6)
 
-    # ── Oval mask: giới hạn heatmap trong vùng đầu/mặt ───────────────────────
-    # CNN không có positional prior như ViT nên gradient dễ lan xuống cổ/áo.
-    # Crop đã được square-crop quanh bbox mặt (scale ~1.10) nên center oval
-    # luôn nằm đúng vị trí khuôn mặt.
+    # Oval mask: giới hạn heatmap trong vùng đầu/mặt
     H_c, W_c = cam_avg.shape
     cy = int(H_c * 0.48)
     cx = int(W_c * 0.50)
@@ -231,8 +254,70 @@ def generate_cam_cnn(
     cam_avg = cam_avg * oval_mask
     cam_avg = cam_avg - cam_avg.min()
     cam_avg = cam_avg / (cam_avg.max() + 1e-6)
-
     return cam_avg
+
+
+def generate_cam_cnn_with_ctx(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    ctx: CnnHookContext,
+    target_index: int = 0,
+    device: str = "cuda",
+    extra_smooth: bool = False,
+) -> np.ndarray:
+    """
+    GradCAM++ nhanh nhất — dùng hook đã cache từ CnnHookContext.
+    smooth_samples=1: trên CUDA 1 pass đã stable, không cần SmoothGrad.
+    Gọi hàm này từ inference.py thay cho generate_cam_cnn khi có ctx.
+    """
+    model.eval()
+    first_param = next(model.parameters())
+    x0 = input_tensor.to(device=device, dtype=first_param.dtype)
+
+    cam = _gradcam_pp_with_ctx(model, x0, ctx, target_index, device)
+    return _apply_cnn_postprocess(cam, extra_smooth)
+
+
+def generate_cam_cnn(
+    model: nn.Module,
+    input_tensor: torch.Tensor,
+    target_index: int = 1,
+    target_layer: Optional[nn.Module] = None,
+    device: str = "cuda",
+    smooth_samples: int = 1,
+    smooth_noise: float = 0.015,
+    extra_smooth: bool = False,
+) -> np.ndarray:
+    """
+    GradCAM++ cho CNN — fallback khi không dùng CnnHookContext.
+    smooth_samples mặc định = 1 (CUDA không cần SmoothGrad để stable).
+    Nếu muốn SmoothGrad tăng lên 3, nhưng 1 là đủ trên GPU.
+
+    Giữ nguyên serial loop — KHÔNG batch nhiều samples vào 1 forward:
+    EfficientNet/ResNet dùng BatchNorm → batch N samples làm BN tính
+    statistics cross-sample → gradient bị pha trộn chéo → heatmap nhiễu.
+    """
+    model.eval()
+    if target_layer is None:
+        raise ValueError("Bạn phải truyền target_layer vào generate_cam_cnn")
+
+    first_param = next(model.parameters())
+    model_dtype = first_param.dtype
+    x0 = input_tensor.to(device=device, dtype=model_dtype)
+
+    if smooth_samples <= 1:
+        # Fast path: 1 pass, không tạo noise, không stack
+        cam = _gradcam_plus_plus_single(model, x0, target_layer, target_index, device)
+    else:
+        inp_std = float(x0.float().std().item()) * smooth_noise
+        cams = []
+        for i in range(smooth_samples):
+            noisy = x0 if (i == 0 or inp_std <= 0) else x0 + torch.randn_like(x0) * inp_std
+            cams.append(_gradcam_plus_plus_single(model, noisy, target_layer, target_index, device))
+        cams_stack = np.stack(cams, axis=0)
+        cam = np.median(cams_stack, axis=0) if extra_smooth else np.mean(cams_stack, axis=0)
+
+    return _apply_cnn_postprocess(cam, extra_smooth)
 
 
 # ═══════════════════════════════════════════════════════════════

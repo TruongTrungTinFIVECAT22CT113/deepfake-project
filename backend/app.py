@@ -334,9 +334,13 @@ async def analyze(
             "method_rows": method_rows_total,
             "method_distribution": counts,
             "frame_tags": stats.get("frame_tags", []),
-            "analyzed_start_sec": start_used if clip_path else None,
-            "analyzed_end_sec": end_used if clip_path else None,
+            # Trả về start/end thực sự người dùng đặt, không phụ thuộc clip_path.
+            # clip_path=None chỉ nghĩa là _clip_range không cắt được (start=0/end>=dur),
+            # nhưng FE vẫn cần biết người dùng có đặt khoảng hay không.
+            "analyzed_start_sec": start_used,
+            "analyzed_end_sec": end_used,
             "explanation_basic": explanation_basic,
+            "processing_time_sec": stats.get("processing_time_sec"),
         }
     finally:
         try: os.remove(src_path)
