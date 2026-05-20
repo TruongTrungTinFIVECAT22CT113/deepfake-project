@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
-import os, tempfile
+import os, tempfile, time
 import numpy as np
 import cv2
 import torch
@@ -97,9 +97,13 @@ def _guess_cnn_target_layer(backbone: nn.Module):
             blocks = backbone.blocks
             if hasattr(blocks, "__len__") and len(blocks) > 0:
                 cls_name = backbone.__class__.__name__.lower()
-                # EfficientNet dùng blocks[-2]: discriminative nhất, oval mask lo phần còn lại
-                if "efficientnet" in cls_name and len(blocks) >= 2:
-                    idx = len(blocks) - 2
+                if "efficientnet" in cls_name:
+                    # Ưu tiên conv_head (Conv2d 1×1 sau blocks, spatial 12×12).
+                    # Discriminative nhất, tránh artifact của blocks[-2] (resolution quá nhỏ + nhiễu).
+                    if hasattr(backbone, "conv_head"):
+                        return backbone.conv_head
+                    # Fallback: blocks[-1] tốt hơn blocks[-2]
+                    idx = len(blocks) - 1
                 else:
                     idx = len(blocks) - 1
                 last_block = blocks[idx]
@@ -210,6 +214,8 @@ def analyze_video(
 ):
     if not detectors_info:
         return None, "No enabled model.", {}, ""
+
+    t0 = time.perf_counter()   # bắt đầu đo thời gian xử lý toàn bộ video
 
     if len(detectors_info) == 1:
         thr_used = float(fe_thr_override) if fe_thr_override is not None else float(detectors_info[0].get("best_thr", 0.5))
@@ -434,6 +440,7 @@ def analyze_video(
         writer.release()
 
     duration_sec = frames_total / fps if fps > 0 else 0.0
+    processing_time_sec = time.perf_counter() - t0
     verdict = render_verdict_text(frames_total, fake_frames)
 
     method_rows_total = []
@@ -449,6 +456,7 @@ def analyze_video(
         "fake_ratio": float(fake_frames / max(1, frames_total)),
         "fps": float(fps),
         "duration_sec": float(duration_sec),
+        "processing_time_sec": float(processing_time_sec),
         "threshold_used": float(thr_used),
         "detector_backend_used": backend_used_final or detector_backend,
         "method_distribution": {k: int(v) for k, v in m_count.items()},
