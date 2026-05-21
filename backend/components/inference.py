@@ -215,6 +215,7 @@ def analyze_video(
     allow_fallback: bool = False,
     xai_mode: str = "none",
     xai_primary_index: Optional[int] = None,
+    progress_callback=None,   # Callable[[int, int], None] — (frames_done, frames_total_hint)
 ):
     if not detectors_info:
         return None, "No enabled model.", {}, ""
@@ -236,6 +237,8 @@ def analyze_video(
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
+    # Hint tổng số frame — không chính xác 100% nhưng đủ để tính % tiến trình
+    total_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     tmpdir = tempfile.mkdtemp(prefix="df_web_")
     out_path = os.path.join(tmpdir, "out.mp4")
@@ -449,6 +452,13 @@ def analyze_video(
                 writer.append_data(cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB))
             else:
                 writer.write(out_bgr)
+
+        # ── Gọi progress callback sau mỗi chunk ──────────────────────────────
+        if progress_callback is not None:
+            try:
+                progress_callback(frames_total, total_frames_hint)
+            except Exception:
+                pass
 
     cap.release()
     if use_imageio:

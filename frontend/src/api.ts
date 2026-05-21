@@ -99,36 +99,77 @@ export async function setModelsEnabled(enabled_ids: string[]): Promise<ModelMeta
   return await r.json() as ModelMeta[];
 }
 
+export type ProgressEvent = {
+  type: "progress";
+  frames_done: number;
+  frames_total_hint: number;
+  pct: number;
+};
+
+/**
+ * Gọi /api/analyze qua SSE stream.
+ * - onProgress: gọi mỗi khi nhận được event progress (có thể null nếu không cần)
+ * - Trả về AnalyzeResult khi nhận event "done"
+ * - Throw Error nếu nhận event "error" hoặc network fail
+ */
 export async function analyzeVideo(
   file: File,
-  opts: AnalyzeOptions
+  opts: AnalyzeOptions,
+  onProgress?: (e: ProgressEvent) => void,
 ): Promise<AnalyzeResult> {
   const fd = new FormData();
   fd.append("file", file);
 
-  // Advanced
   fd.append("detector_backend", String(opts.detector_backend ?? "retinaface"));
   fd.append("bbox_scale", String(opts.bbox_scale ?? 1.10));
   fd.append("thickness", String(opts.thickness ?? 3));
 
-  // thr override: chỉ gửi nếu là number; BE sẽ tự ignore nếu >= 2 model
   if (typeof opts.thr === "number" && !Number.isNaN(opts.thr)) {
     fd.append("thr", String(opts.thr));
   }
-
-  // Basic
   if (opts.start_sec != null) fd.append("start_sec", String(opts.start_sec));
-  if (opts.end_sec != null)   fd.append("end_sec", String(opts.end_sec));
+  if (opts.end_sec != null)   fd.append("end_sec",   String(opts.end_sec));
+  if (opts.enabled_ids_csv)   fd.append("enabled_ids_csv", opts.enabled_ids_csv);
+  if (opts.xai_mode)          fd.append("xai_mode", opts.xai_mode);
+  if (opts.xai_model_id)      fd.append("xai_model_id", opts.xai_model_id);
 
-  // Models
-  if (opts.enabled_ids_csv) fd.append("enabled_ids_csv", opts.enabled_ids_csv);
-  if (opts.xai_mode)        fd.append("xai_mode", opts.xai_mode);
-  if (opts.xai_model_id)    fd.append("xai_model_id", opts.xai_model_id);
-
-  const r = await fetch(`${API_BASE}/api/analyze`, {
-    method: "POST",
-    body: fd,
-  });
+  const r = await fetch(`${API_BASE}/api/analyze`, { method: "POST", body: fd });
   if (!r.ok) throw new Error(await r.text());
-  return await r.json() as AnalyzeResult;
+  if (!r.body) throw new Error("Không nhận được stream từ server");
+
+  // Đọc SSE stream line-by-line
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buf += decoder.decode(value, { stream: true });
+
+    // SSE format: "data: {...}\n\n" — tách từng event theo double newline
+    const parts = buf.split("\n\n");
+    buf = parts.pop() ?? "";   // phần cuối chưa hoàn chỉnh → giữ lại buffer
+
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith("data: ")) continue;
+      const jsonStr = line.slice(6);   // bỏ "data: "
+      let evt: any;
+      try { evt = JSON.parse(jsonStr); } catch { continue; }
+
+      if (evt.type === "progress") {
+        onProgress?.(evt as ProgressEvent);
+      } else if (evt.type === "done") {
+        reader.cancel();
+        return evt.result as AnalyzeResult;
+      } else if (evt.type === "error") {
+        reader.cancel();
+        throw new Error(evt.message || "Phân tích thất bại");
+      }
+    }
+  }
+
+  throw new Error("Stream kết thúc bất thường — không nhận được kết quả.");
 }

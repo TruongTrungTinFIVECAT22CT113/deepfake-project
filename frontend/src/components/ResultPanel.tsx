@@ -124,6 +124,7 @@ export default function ResultPanel(props: {
   previewUrl?: string | null;
   previewDuration?: number | null;
   errorMsg?: string | null;
+  progressEvent?: { pct: number; frames_done: number; frames_total_hint: number } | null;
 }): JSX.Element | null {
   const r = props.result;
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -178,50 +179,34 @@ export default function ResultPanel(props: {
     URL.revokeObjectURL(url);
   }
 
-  // ── Fake progress khi loading ────────────────────────────────────────────
-  // Backend không có SSE/WebSocket → không có progress thực tế.
-  // Dùng easing asymptotic: progress = 99 * (1 - e^(-t/τ))
-  //   - Không bao giờ đứng cứng, luôn tăng (ngày càng chậm hơn)
-  //   - τ (tau) = ước tính thời gian xử lý = videoDuration / 2 (baseline 2× realtime)
-  //   - Ở t=τ: ~63%, t=2τ: ~86%, t=3τ: ~95%, không bao giờ đạt 100% cho đến khi xong thật
-  const [progress, setProgress] = useState(0);
-  const progressRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const progressStartRef = useRef<number>(0);
-  const progressTauRef = useRef<number>(30000);  // ms
+  // ── Progress thực tế từ SSE ───────────────────────────────────────────────
+  const [displayPct, setDisplayPct] = useState(0);
 
   useEffect(() => {
-    if (props.loading) {
-      setProgress(0);
-      progressStartRef.current = Date.now();
-      // τ = videoDuration/2 giây, tối thiểu 8s, tối đa 300s
-      const videoDur = props.previewDuration ?? 60;
-      progressTauRef.current = Math.min(300_000, Math.max(8_000, (videoDur / 2) * 1000));
-
-      progressRef.current = setInterval(() => {
-        const elapsed = Date.now() - progressStartRef.current;
-        const tau = progressTauRef.current;
-        // Asymptotic: 99 * (1 - e^(-t/τ)), tối đa 99%
-        const pct = 99 * (1 - Math.exp(-elapsed / tau));
-        setProgress(Math.min(99, pct));
-      }, 250);
-    } else {
-      if (progressRef.current) {
-        clearInterval(progressRef.current);
-        progressRef.current = null;
-      }
-      if (progress > 0) {
-        setProgress(100);
-        const t = setTimeout(() => setProgress(0), 700);
+    if (!props.loading) {
+      if (displayPct > 0) {
+        setDisplayPct(100);
+        const t = setTimeout(() => setDisplayPct(0), 700);
         return () => clearTimeout(t);
       }
+    } else {
+      setDisplayPct(0);   // reset khi bắt đầu job mới
     }
-    return () => {
-      if (progressRef.current) { clearInterval(progressRef.current); progressRef.current = null; }
-    };
   }, [props.loading]);
 
+  useEffect(() => {
+    if (props.progressEvent && props.loading) {
+      setDisplayPct(props.progressEvent.pct);
+    }
+  }, [props.progressEvent]);
+
   if (props.loading) {
-    const pct = Math.round(progress);
+    const pct = Math.round(displayPct);
+    const pe = props.progressEvent;
+    const frameLabel = pe && pe.frames_total_hint > 0
+      ? `${pe.frames_done} / ${pe.frames_total_hint} khung hình`
+      : null;
+
     return (
       <div className="stack" style={{ padding: "0.5rem 0" }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: "0.4rem" }}>
@@ -236,23 +221,25 @@ export default function ResultPanel(props: {
           height: "0.55rem", borderRadius: "1rem", background: "var(--surface-3)",
           border: "1px solid var(--border-subtle)", overflow: "hidden",
         }}>
-          {/* Fill với transition mượt */}
           <div style={{
             height: "100%", borderRadius: "1rem",
             width: `${pct}%`,
             background: pct < 95
               ? "linear-gradient(90deg, var(--accent, #6366f1), #a78bfa)"
               : "linear-gradient(90deg, #22c55e, #4ade80)",
-            transition: "width 0.18s ease-out, background 0.4s",
+            transition: "width 0.25s ease-out, background 0.4s",
           }} />
         </div>
 
         <div style={{ fontSize: "0.8rem", color: "var(--text-secondary)", marginTop: "0.25rem" }}>
-          {pct < 25 && "Đang nhận diện khuôn mặt…"}
-          {pct >= 25 && pct < 55 && "Đang phân tích từng khung hình…"}
-          {pct >= 55 && pct < 80 && "Đang tổng hợp kết quả…"}
-          {pct >= 80 && pct < 99 && "Đang hoàn thiện, vui lòng chờ…"}
-          {pct >= 99 && "Chuẩn bị trả về kết quả…"}
+          {frameLabel
+            ? frameLabel
+            : pct < 5
+              ? "Đang chuẩn bị…"
+              : pct < 95
+                ? "Đang phân tích khung hình…"
+                : "Đang hoàn thiện kết quả…"
+          }
         </div>
 
         {/* Preview video mờ trong khi chờ */}

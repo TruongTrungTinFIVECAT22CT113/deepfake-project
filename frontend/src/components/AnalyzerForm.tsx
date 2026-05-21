@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
-import { analyzeVideo, AnalyzeOptions, type ModelMeta } from "../api";
+import { analyzeVideo, AnalyzeOptions, type ModelMeta, type ProgressEvent } from "../api";
 import { useToast } from "./Toast";
 import type { ThemeId } from "../App";
 
@@ -11,7 +11,7 @@ const THEME_OPTIONS: { id: ThemeId; label: string }[] = [
 ];
 
 export default function AnalyzerForm({
-  onResult, setLoading, enabledIds, models, theme, setTheme, onPreviewUrl, onPreviewDuration, onError,
+  onResult, setLoading, enabledIds, models, theme, setTheme, onPreviewUrl, onPreviewDuration, onError, onProgress,
 }: {
   onResult: (r: Awaited<ReturnType<typeof analyzeVideo>>) => void;
   setLoading: (b: boolean) => void;
@@ -22,6 +22,7 @@ export default function AnalyzerForm({
   onPreviewUrl: (url: string | null) => void;
   onPreviewDuration: (d: number | null) => void;
   onError: (msg: string | null) => void;
+  onProgress?: (e: ProgressEvent) => void;
 }): JSX.Element {
   const fileRef = useRef<HTMLInputElement>(null);
   const { addToast } = useToast();
@@ -131,7 +132,7 @@ export default function AnalyzerForm({
 
     setLoading(true);
     try {
-      const res = await analyzeVideo(f, opts);
+      const res = await analyzeVideo(f, opts, onProgress);
       onResult(res);
       if (res?.thr_override_ignored) addToast("Đang bật nhiều mô hình → sử dụng ngưỡng trung bình; bỏ qua giá trị ghi đè.");
       else addToast("Phân tích hoàn tất", "success");

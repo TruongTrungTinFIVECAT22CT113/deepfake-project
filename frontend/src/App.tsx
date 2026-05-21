@@ -4,7 +4,7 @@ import Footer from "./components/Footer";
 import AnalyzerForm from "./components/AnalyzerForm";
 import ResultPanel from "./components/ResultPanel";
 import ModelSelectorCard from "./components/ModelSelectorCard";
-import { getHealth, listModels, setModelsEnabled, type ModelMeta, type AnalyzeResult } from "./api";
+import { getHealth, listModels, setModelsEnabled, type ModelMeta, type AnalyzeResult, type ProgressEvent } from "./api";
 import { ToastProvider } from "./components/Toast";
 
 export type ThemeId = "dark" | "light" | "balanced" | "colorblind";
@@ -15,6 +15,7 @@ export default function App(): JSX.Element {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewDuration, setPreviewDuration] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [progressEvent, setProgressEvent] = useState<ProgressEvent | null>(null);
 
   // Theme — default is "balanced"
   const [theme, setTheme] = useState<ThemeId>(() =>
@@ -65,7 +66,7 @@ export default function App(): JSX.Element {
           <section className="card stack">
             <div className="section-title">Phân tích video</div>
             <AnalyzerForm
-              onResult={(r) => { setErrorMsg(null); setRes(r); }}
+              onResult={(r) => { setErrorMsg(null); setProgressEvent(null); setRes(r); }}
               setLoading={setLoading}
               enabledIds={enabledIds}
               models={models}
@@ -74,6 +75,7 @@ export default function App(): JSX.Element {
               onPreviewUrl={setPreviewUrl}
               onPreviewDuration={setPreviewDuration}
               onError={setErrorMsg}
+              onProgress={(e) => setProgressEvent(e)}
             />
             {loading && (
               <div className="loading-row">
@@ -84,7 +86,7 @@ export default function App(): JSX.Element {
           </section>
 
           <section className="card full-span">
-            <ResultPanel result={res} loading={loading} previewUrl={previewUrl} previewDuration={previewDuration} errorMsg={errorMsg} />
+            <ResultPanel result={res} loading={loading} previewUrl={previewUrl} previewDuration={previewDuration} errorMsg={errorMsg} progressEvent={progressEvent} />
           </section>
         </div>
       </main>

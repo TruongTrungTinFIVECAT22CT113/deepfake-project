@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-import os, tempfile, pathlib
+import os, tempfile, pathlib, json, asyncio, threading
 from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -274,80 +274,123 @@ async def analyze(
         f.write(await file.read())
         src_path = f.name
 
-    clip_path = None
-    try:
-        clip_path = _clip_range(src_path, start_sec, end_sec)
-        start_used = float(start_sec) if start_sec is not None else None
-        end_used = float(end_sec) if end_sec is not None else None
+    start_used = float(start_sec) if start_sec is not None else None
+    end_used   = float(end_sec)   if end_sec   is not None else None
 
-        use_path = clip_path or src_path
-        out_path, verdict, stats, method_rows = analyze_video(
-            use_path,
-            chosen,
-            _METHOD_NAMES or [],
-            fe_thr_override=None if thr_override_ignored else fe_thr,
-            detector_backend=detector_backend,
-            bbox_scale=float(bbox_scale),
-            det_thr=0.5,
-            box_thickness=int(thickness),
-            xai_mode=xai_mode,
-            xai_primary_index=xai_primary_index,
-        )
+    # ── SSE generator ──────────────────────────────────────────────────────────
+    # analyze_video chạy trong thread riêng (blocking).
+    # Dùng asyncio.Queue để bridge: thread ghi vào queue, coroutine đọc ra stream.
+    queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
 
-        if not out_path:
-            return JSONResponse({"error": verdict or "Phân tích thất bại."}, status_code=400)
-        if not os.path.isfile(out_path):
-            return JSONResponse({"error": verdict or "Không tạo được video kết quả."}, status_code=500)
+    def _progress_cb(frames_done: int, frames_total_hint: int):
+        """Gọi từ thread inference, đẩy event vào queue thread-safe."""
+        pct = (frames_done / frames_total_hint * 100) if frames_total_hint > 0 else 0
+        event = json.dumps({
+            "type": "progress",
+            "frames_done": frames_done,
+            "frames_total_hint": frames_total_hint,
+            "pct": round(min(99.0, pct), 1),
+        })
+        asyncio.run_coroutine_threadsafe(queue.put(event), loop)
 
-        frames_total = int(stats.get("frames_total", 0))
-        fake_frames  = int(stats.get("fake_frames", 0))
-        counts: Dict[str, int] = {k: int(v) for k, v in (stats.get("method_distribution") or {}).items()}
+    def _run_analyze():
+        clip_path = None
+        try:
+            clip_path = _clip_range(src_path, start_sec, end_sec)
+            use_path = clip_path or src_path
 
-        method_rows_total = _build_method_rows(counts, frames_total)
-        method_rows_fake  = _build_method_rows_fake(counts)
-        fake_ratio = float(stats.get("fake_ratio", 0.0))
-        explanation_basic = _build_basic_explanation(method_rows_total, method_rows_fake, fake_ratio)
+            out_path, verdict, stats, method_rows = analyze_video(
+                use_path, chosen, _METHOD_NAMES or [],
+                fe_thr_override=None if thr_override_ignored else fe_thr,
+                detector_backend=detector_backend,
+                bbox_scale=float(bbox_scale),
+                det_thr=0.5,
+                box_thickness=int(thickness),
+                xai_mode=xai_mode,
+                xai_primary_index=xai_primary_index,
+                progress_callback=_progress_cb,
+            )
 
-        token = os.path.basename(os.path.dirname(out_path))
-        fname = "result.mp4"
-        final_path = os.path.join(os.path.dirname(out_path), fname)
-        if out_path != final_path:
-            try: os.replace(out_path, final_path)
+            if not out_path or not os.path.isfile(out_path):
+                err = json.dumps({"type": "error", "message": verdict or "Phân tích thất bại."})
+                asyncio.run_coroutine_threadsafe(queue.put(err), loop)
+                return
+
+            frames_total = int(stats.get("frames_total", 0))
+            fake_frames  = int(stats.get("fake_frames", 0))
+            counts: Dict[str, int] = {k: int(v) for k, v in (stats.get("method_distribution") or {}).items()}
+
+            method_rows_total = _build_method_rows(counts, frames_total)
+            method_rows_fake  = _build_method_rows_fake(counts)
+            fake_ratio = float(stats.get("fake_ratio", 0.0))
+            explanation_basic = _build_basic_explanation(method_rows_total, method_rows_fake, fake_ratio)
+
+            token = os.path.basename(os.path.dirname(out_path))
+            fname = "result.mp4"
+            final_path = os.path.join(os.path.dirname(out_path), fname)
+            if out_path != final_path:
+                try: os.replace(out_path, final_path)
+                except Exception: pass
+
+            result_payload = {
+                "type": "done",
+                "result": {
+                    "verdict": verdict,
+                    "verdict_level": _get_verdict_level(fake_ratio),
+                    "video_url": f"/api/download/{token}/{fname}",
+                    "frames_total": frames_total,
+                    "fake_frames": fake_frames,
+                    "fake_ratio": stats.get("fake_ratio", 0.0),
+                    "fps": stats.get("fps", 0.0),
+                    "duration_sec": stats.get("duration_sec", 0.0),
+                    "threshold_used": float(thr_used),
+                    "thr_override_ignored": thr_override_ignored,
+                    "detector_backend_used": stats.get("detector_backend_used"),
+                    "method_rows_total": method_rows_total,
+                    "method_rows_fake": method_rows_fake,
+                    "method_rows": method_rows_total,
+                    "method_distribution": counts,
+                    "frame_tags": stats.get("frame_tags", []),
+                    "analyzed_start_sec": start_used,
+                    "analyzed_end_sec": end_used,
+                    "explanation_basic": explanation_basic,
+                    "processing_time_sec": stats.get("processing_time_sec"),
+                }
+            }
+            done_event = json.dumps(result_payload)
+            asyncio.run_coroutine_threadsafe(queue.put(done_event), loop)
+
+        except Exception as ex:
+            err = json.dumps({"type": "error", "message": str(ex)})
+            asyncio.run_coroutine_threadsafe(queue.put(err), loop)
+        finally:
+            try: os.remove(src_path)
             except Exception: pass
+            if clip_path:
+                try: os.remove(clip_path)
+                except Exception: pass
+            # Sentinel: báo generator biết đã xong
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop)
 
-        verdict_level = _get_verdict_level(fake_ratio)
+    # Chạy analyze trong thread riêng — không block event loop
+    threading.Thread(target=_run_analyze, daemon=True).start()
 
-        return {
-            "verdict": verdict,
-            "verdict_level": verdict_level,
-            "video_url": f"/api/download/{token}/{fname}",
-            "frames_total": frames_total,
-            "fake_frames": fake_frames,
-            "fake_ratio": stats.get("fake_ratio", 0.0),
-            "fps": stats.get("fps", 0.0),
-            "duration_sec": stats.get("duration_sec", 0.0),
-            "threshold_used": float(thr_used),
-            "thr_override_ignored": thr_override_ignored,
-            "detector_backend_used": stats.get("detector_backend_used"),
-            "method_rows_total": method_rows_total,
-            "method_rows_fake": method_rows_fake,
-            "method_rows": method_rows_total,
-            "method_distribution": counts,
-            "frame_tags": stats.get("frame_tags", []),
-            # Trả về start/end thực sự người dùng đặt, không phụ thuộc clip_path.
-            # clip_path=None chỉ nghĩa là _clip_range không cắt được (start=0/end>=dur),
-            # nhưng FE vẫn cần biết người dùng có đặt khoảng hay không.
-            "analyzed_start_sec": start_used,
-            "analyzed_end_sec": end_used,
-            "explanation_basic": explanation_basic,
-            "processing_time_sec": stats.get("processing_time_sec"),
-        }
-    finally:
-        try: os.remove(src_path)
-        except Exception: pass
-        if clip_path:
-            try: os.remove(clip_path)
-            except Exception: pass
+    async def _sse_generator():
+        while True:
+            item = await queue.get()
+            if item is None:   # sentinel → kết thúc stream
+                break
+            yield f"data: {item}\n\n"
+
+    return StreamingResponse(
+        _sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # tắt nginx buffering nếu có proxy
+        },
+    )
 
 
 @app.get("/api/download/{token}/{filename}")
