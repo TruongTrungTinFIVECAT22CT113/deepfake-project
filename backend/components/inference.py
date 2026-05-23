@@ -28,12 +28,12 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
 ENSEMBLE_THR_DEFAULT = 0.58
 
-BASE_BATCH_SIZE = 64
-XAI_BATCH_SIZE  = 48
+BASE_BATCH_SIZE = 48
+XAI_BATCH_SIZE  = 24
 
 # Số frame đọc vào RAM trước khi detect + infer cùng lúc.
 # Tăng nếu GPU VRAM > 8 GB, giảm nếu RAM thấp.
-READ_AHEAD = 128
+READ_AHEAD = 64
 
 
 def build_eval_transform(img_size: int):
@@ -61,13 +61,15 @@ def _ensemble_predict_batch(detectors_info, crops_bgr, tx, method_names):
 
     for info in detectors_info:
         first_param = next(info["model"].parameters())
-        # Cast tensor sang đúng dtype của từng model — an toàn khi XAI thay đổi dtype 1 model
+        # Cast tensor sang đúng dtype của từng model
         t = batch_tensors.to(dtype=first_param.dtype) if batch_tensors.dtype != first_param.dtype else batch_tensors
         lb, lm, *_ = info["model"](t)
-        pbin = torch.softmax(lb, dim=1)
+        # .float() trước softmax: đồng nhất với sweep_ensemble_thr_spatial.py
+        # (sweep dùng softmax(lb.float())) — tránh sai lệch FP16 xung quanh biên threshold 0.58
+        pbin = torch.softmax(lb.float(), dim=1)
         p_fake_list.append(pbin[:, 0])
         if method_names:
-            pm_list.append(torch.softmax(lm, dim=1))
+            pm_list.append(torch.softmax(lm.float(), dim=1))
 
     p_fake_avg = torch.mean(torch.stack(p_fake_list), dim=0).cpu().numpy()
     pm_avg = torch.mean(torch.stack(pm_list), dim=0).cpu().numpy() if pm_list else None
@@ -237,7 +239,6 @@ def analyze_video(
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
-    # Hint tổng số frame — không chính xác 100% nhưng đủ để tính % tiến trình
     total_frames_hint = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     tmpdir = tempfile.mkdtemp(prefix="df_web_")
