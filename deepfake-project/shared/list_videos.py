@@ -14,7 +14,7 @@ def scan_videos(root):
                 f.write("-" * (len(rel) + 5) + "\n")
                 for vid in sorted(videos):
                     f.write(f"{vid}\n")
-    print(f"✅ Đã quét xong. Log lưu tại: {LOG_FILE}")
+    print(f"✅ Đã quét xong. lưu tại: {LOG_FILE}")
 
 if __name__ == "__main__":
     scan_videos(ROOT)
