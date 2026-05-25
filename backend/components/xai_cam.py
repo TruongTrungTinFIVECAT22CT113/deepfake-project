@@ -430,8 +430,8 @@ def generate_cam_vit(
         _sigma = 15
     else:
         # ViT — ellipse rộng hơn, chỉ cắt phần tràn
-        _ry_frac, _rx_frac = 0.50, 0.46
-        _sigma = 20
+        _ry_frac, _rx_frac = 0.42, 0.38
+        _sigma = 12
 
     if True:  # áp cho cả ViT lẫn BEiT
         H_c, W_c = cam_norm.shape
@@ -448,7 +448,7 @@ def generate_cam_vit(
         cam_norm = cam_norm / (cam_norm.max() + 1e-6)
         # Tăng contrast: power > 1 làm vùng thấp xuống nhanh hơn
         # chỉ giữ lại vùng thực sự "nóng", tránh cả mặt đỏ đều
-        _power = 2.2 if not smooth_output else 1.5
+        _power = 3.0 if not smooth_output else 1.5
         cam_norm = np.power(cam_norm, _power)
 
     return cam_norm
